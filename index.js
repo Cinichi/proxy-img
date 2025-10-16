@@ -78,7 +78,7 @@ async function handleCompressedImage(
   wsrvParams.set("n", "-1");
   if (width > 0) wsrvParams.set("w", width.toString());
   if (height > 0) wsrvParams.set("h", height.toString());
-  if (grayscale) wsrvParams.set("filter", "greyscale");
+  if (grayscale) wsrvParams.set('f', 'greyscale');;
 
   const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
 
