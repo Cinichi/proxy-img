@@ -9,3 +9,7 @@ workers_dev = true
 enabled = true
 head_sampling_rate = 1
 invocation_logs = true
+
+[[kv_namespaces]]
+binding = "KV_STATS"
+id = "4b4bcfc5cc664fa9b62771f9d3a5d162"
