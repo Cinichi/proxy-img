@@ -225,18 +225,28 @@ async function saveStats(env, stats) {
 }
 // ---- /stats dashboard ----
 async function handleStats(request, env) {
-  const url = new URL(request.url);
-  const jsonMode = url.searchParams.get("json") === "1";
-  const stats = await getFreshStats(env);
-  if (jsonMode) {
-    return new Response(JSON.stringify(stats, null, 2), {
-      headers: { "Content-Type": "application/json; charset=utf-8" },
+  try {
+    const url = new URL(request.url);
+    const jsonMode = url.searchParams.get("json") === "1";
+    const stats = await getFreshStats(env);
+
+    if (jsonMode) {
+      return new Response(JSON.stringify(stats, null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+
+    return new Response(renderStatsHTML(stats), {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
     });
+  } catch (err) {
+    console.error("❌ /stats failed:", err);
+    return new Response(
+      JSON.stringify({ error: err.message || "Stats render failed" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
-  return new Response(renderStatsHTML(stats), {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
-}
+                      }
 
 function renderStatsHTML(stats) {
   const hitRate = stats.requests
@@ -266,3 +276,4 @@ h1{color:#4f46e5}
 <p style="margin-top:25px;color:#666">Auto-saves stats in Cloudflare KV. Refresh to update.</p>
 </div></body></html>`;
 }
+
