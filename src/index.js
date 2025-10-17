@@ -5,6 +5,7 @@
 // ✅ Enhanced logging and metrics
 // ✅ Compression ratio tracking
 // ✅ Smart fallback system
+// ✅ Tachiyomi jpg parameter support (jpg=0 for WebP, jpg=1 for JPEG)
 
 export default {
   async fetch(request, env, ctx) {
@@ -12,7 +13,7 @@ export default {
 
     // Handle CORS preflight
     if (request.method === "OPTIONS") return handleCORS();
-
+    
     // Only allow GET/HEAD
     if (!["GET", "HEAD"].includes(request.method)) {
       return errorResponse("Method not allowed", 405);
@@ -20,7 +21,7 @@ export default {
 
     const url = new URL(request.url);
     const targetUrl = url.searchParams.get("url");
-
+    
     // Show web interface if no URL
     if (!targetUrl) return getWebInterface();
 
@@ -35,10 +36,25 @@ export default {
     }
 
     // Parse Bandwidth Hero / Tachiyomi parameters
-    const bw = url.searchParams.get("bw") === "1";  // ✅ FIXED: was !== "0"
+    const bw = url.searchParams.get("bw") === "1";
     const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
-    const jpeg = url.searchParams.get("jpeg") === "1";
+    
+    // Handle both "jpeg" and "jpg" parameters (Tachiyomi uses "jpg")
+    // jpg=0 means WebP (default), jpg=1 means force JPEG
+    const jpgParam = url.searchParams.get("jpg");
+    const jpegParam = url.searchParams.get("jpeg");
+    const jpeg = jpgParam === "1" || jpegParam === "1";
+    
     const debug = url.searchParams.get("debug") === "1";
+
+    // Log incoming request
+    console.log("📥 Incoming request:");
+    console.log(`   URL: ${targetUrl}`);
+    console.log(`   Quality: ${quality}% (l=${url.searchParams.get("l")})`);
+    console.log(`   Grayscale: ${bw} (bw=${url.searchParams.get("bw")})`);
+    console.log(`   JPEG mode: ${jpeg} (jpg=${url.searchParams.get("jpg")}, jpeg=${url.searchParams.get("jpeg")})`);
+    console.log(`   Output format: ${jpeg ? "JPEG" : "WebP"}`);
+    console.log(`   Debug: ${debug}`);
 
     try {
       return await handleCompressedImage(
@@ -68,20 +84,20 @@ async function handleCompressedImage(
 ) {
   // Build wsrv.nl URL - ONLY VALID PARAMETERS
   const wsrvParams = new URLSearchParams();
-
+  
   wsrvParams.set("url", targetUrl);
   wsrvParams.set("q", quality.toString());
   wsrvParams.set("output", jpeg ? "jpg" : "webp");
   wsrvParams.set("default", "1");  // Return original on error
   wsrvParams.set("n", "-1");       // No cache busting
-
+  
   // ✅ ONLY add grayscale if explicitly requested
   if (grayscale) {
     wsrvParams.set("il", "");  // Inline processing
   }
 
   const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
-
+  
   if (debug) {
     console.log("🔍 Debug Info:");
     console.log("  Target URL:", targetUrl);
@@ -94,7 +110,7 @@ async function handleCompressedImage(
   // Create cache key (unique per quality)
   const cacheKey = new Request(`${wsrvUrl}-q${quality}-${jpeg ? "jpg" : "webp"}`);
   const cache = caches.default;
-
+  
   // Check cache first (skip in debug mode)
   if (!debug) {
     const cached = await cache.match(cacheKey);
@@ -103,7 +119,7 @@ async function handleCompressedImage(
       return addHeaders(cached, startTime, "HIT-COMPRESSED", quality, wsrvUrl, debug);
     }
   }
-
+  
   console.log("❌ Cache MISS - fetching from wsrv.nl");
 
   // Browser User-Agent for anti-hotlink protection
@@ -129,9 +145,22 @@ async function handleCompressedImage(
   // Validate response
   const contentType = response.headers.get("content-type") || "";
   const isImage = contentType.startsWith("image/");
-
+  
+  // Enhanced error handling with better logging
   if (!response.ok || !isImage) {
-    console.warn(`⚠️ wsrv.nl failed: ${response.status}, content-type: ${contentType}`);
+    console.warn(`⚠️ wsrv.nl failed: ${response.status} ${response.statusText}`);
+    console.warn(`   Content-Type: ${contentType}`);
+    console.warn(`   URL attempted: ${wsrvUrl}`);
+    
+    // Common failure reasons
+    if (response.status === 403) {
+      console.warn("   → Origin server blocking wsrv.nl (403 Forbidden)");
+    } else if (response.status === 404) {
+      console.warn("   → Image not found (404)");
+    } else if (response.status >= 500) {
+      console.warn("   → wsrv.nl server error");
+    }
+    
     console.log("🔄 Falling back to direct fetch");
     return await handleDirectImage(targetUrl, browserUA, startTime, ctx);
   }
@@ -140,7 +169,7 @@ async function handleCompressedImage(
   let compressionRatio = "N/A";
   const originalSize = response.headers.get("x-upstream-response-length");
   const compressedSize = response.headers.get("content-length");
-
+  
   if (originalSize && compressedSize) {
     const saved = ((1 - parseInt(compressedSize) / parseInt(originalSize)) * 100);
     compressionRatio = `${saved.toFixed(1)}%`;
@@ -160,14 +189,14 @@ async function handleCompressedImage(
 
 async function handleDirectImage(targetUrl, ua, startTime, ctx) {
   console.log("🔄 Direct fetch for:", targetUrl);
-
+  
   const origin = new URL(targetUrl).origin;
-
+  
   // Check cache
   const cache = caches.default;
   const cacheKey = new Request(`direct-${targetUrl}`);
   const cached = await cache.match(cacheKey);
-
+  
   if (cached) {
     console.log("✅ Direct cache HIT");
     return addHeaders(cached, startTime, "HIT-DIRECT", 100);
@@ -188,8 +217,15 @@ async function handleDirectImage(targetUrl, ua, startTime, ctx) {
   });
 
   if (!response.ok) {
-    console.error(`❌ Direct fetch failed: ${response.status}`);
-    return errorResponse(`Direct fetch failed: HTTP ${response.status}`, response.status);
+    console.error(`❌ Direct fetch failed: ${response.status} ${response.statusText}`);
+    console.error(`   URL: ${targetUrl}`);
+    console.error(`   Headers sent: ${JSON.stringify(Object.fromEntries([...response.headers]))}`);
+    
+    // Return more helpful error
+    return errorResponse(
+      `Failed to fetch image: ${response.status} ${response.statusText}. The origin server may be blocking requests or the image doesn't exist.`,
+      response.status
+    );
   }
 
   console.log(`✅ Direct fetch successful: ${response.headers.get("content-type")}`);
@@ -203,40 +239,40 @@ async function handleDirectImage(targetUrl, ua, startTime, ctx) {
 
 function addHeaders(response, startTime, cacheStatus, quality = 0, wsrvUrl = "", debug = false, compressionRatio = "N/A") {
   const headers = new Headers(response.headers);
-
+  
   // CORS headers
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Expose-Headers", "*");
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-
+  
   // Cache headers
   headers.set("Cache-Control", "public, max-age=604800, immutable");
   headers.set("CDN-Cache-Control", "public, max-age=31536000");
-
+  
   // Performance metrics
   headers.set("X-Cache-Status", cacheStatus);
   headers.set("X-Response-Time", `${Date.now() - startTime}ms`);
   headers.set("X-Quality", quality.toString());
   headers.set("X-Compression-Ratio", compressionRatio);
   headers.set("X-Powered-By", "Bandwidth-Hero-Worker");
-
+  
   // Identify compression method
   if (cacheStatus.includes("COMPRESSED")) {
     headers.set("X-Compressed-By", "wsrv.nl");
   }
-
+  
   // Debug headers
   if (debug && wsrvUrl) {
     headers.set("X-Debug-WSRV-URL", wsrvUrl);
     headers.set("X-Debug-Original-Size", response.headers.get("x-upstream-response-length") || "unknown");
     headers.set("X-Debug-Compressed-Size", response.headers.get("content-length") || "unknown");
   }
-
+  
   // Remove problematic headers
   headers.delete("Content-Security-Policy");
   headers.delete("X-Frame-Options");
   headers.delete("X-Content-Type-Options");
-
+  
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -405,15 +441,15 @@ function getWebInterface() {
   <div class="container">
     <h1>⚡ Bandwidth Hero Proxy</h1>
     <p class="subtitle">Production-ready Cloudflare Worker for Tachiyomi & Bandwidth Hero</p>
-
+    
     <div class="status">
       ✅ <strong>Status:</strong> Compression active and verified working<br>
       ✅ <strong>Provider:</strong> wsrv.nl (libvips/sharp engine)<br>
       ✅ <strong>Cache:</strong> 7-day intelligent caching<br>
       ✅ <strong>Fallback:</strong> Automatic direct fetch on errors<br>
-      ✅ <strong>Version:</strong> Production v1.0
+      ✅ <strong>Version:</strong> Production v1.1 (Tachiyomi jpg parameter support)
     </div>
-
+    
     <div class="stats-grid">
       <div class="stat-card">
         <div class="stat-number">~55%</div>
@@ -428,7 +464,7 @@ function getWebInterface() {
         <div class="stat-label">Cache Duration</div>
       </div>
     </div>
-
+    
     <div class="section">
       <h2>📚 Parameters (Bandwidth Hero Compatible)</h2>
       <table>
@@ -460,9 +496,9 @@ function getWebInterface() {
             <td>0 (off)</td>
           </tr>
           <tr>
-            <td><code>jpeg</code></td>
-            <td>Force JPEG output</td>
-            <td>jpeg=1</td>
+            <td><code>jpeg</code> / <code>jpg</code></td>
+            <td>Force JPEG output (0=WebP, 1=JPEG)</td>
+            <td>jpg=1 or jpeg=1</td>
             <td>0 (WebP)</td>
           </tr>
           <tr>
@@ -474,29 +510,32 @@ function getWebInterface() {
         </tbody>
       </table>
     </div>
-
+    
     <div class="section">
       <h2>🚀 Usage Examples</h2>
-
+      
       <h3>Basic (Default 75% quality, WebP):</h3>
       <div class="endpoint">${location.origin}/?url=IMAGE_URL</div>
-
+      
       <h3>High Compression (50% quality):</h3>
       <div class="endpoint">${location.origin}/?url=IMAGE_URL&l=50</div>
-
+      
       <h3>Grayscale Mode:</h3>
       <div class="endpoint">${location.origin}/?url=IMAGE_URL&bw=1&l=60</div>
-
+      
       <h3>Force JPEG Output:</h3>
       <div class="endpoint">${location.origin}/?url=IMAGE_URL&jpeg=1&l=70</div>
-
+      
+      <h3>Tachiyomi Format (jpg=0 for WebP, bw=0 for color):</h3>
+      <div class="endpoint">${location.origin}/?jpg=0&l=90&bw=0&url=IMAGE_URL</div>
+      
       <h3>Debug Mode (shows wsrv.nl URL):</h3>
       <div class="endpoint">${location.origin}/?url=IMAGE_URL&debug=1</div>
-
+      
       <h3>Full Example:</h3>
       <div class="endpoint">${location.origin}/?url=https%3A%2F%2Fpicsum.photos%2F2000%2F3000&l=50&debug=1</div>
     </div>
-
+    
     <div class="section">
       <h2>📱 Tachiyomi Setup</h2>
       <ol>
@@ -506,17 +545,18 @@ function getWebInterface() {
         <li>Enter: <code>${location.origin}/?url=</code></li>
         <li>Save and restart the app</li>
       </ol>
-
+      
       <div class="highlight">
-        💡 <strong>Pro Tip:</strong> Images will be automatically compressed to ~75% quality
+        💡 <strong>Pro Tip:</strong> Images will be automatically compressed to ~75% quality 
         in WebP format, saving ~50% bandwidth with no visible quality loss!
       </div>
     </div>
-
+    
     <div class="section">
       <h2>🔧 Features</h2>
       <div class="feature">WebP compression (40-70% file size reduction)</div>
       <div class="feature">JPEG fallback option for compatibility</div>
+      <div class="feature">Tachiyomi jpg parameter support (jpg=0/1)</div>
       <div class="feature">Intelligent per-quality caching (7 days)</div>
       <div class="feature">Automatic fallback to direct fetch on errors</div>
       <div class="feature">Browser User-Agent (bypasses hotlink protection)</div>
@@ -526,7 +566,7 @@ function getWebInterface() {
       <div class="feature">Enhanced logging for troubleshooting</div>
       <div class="feature">Fixed grayscale bug (only applies when requested)</div>
     </div>
-
+    
     <div class="section">
       <h2>📊 Compression Results</h2>
       <table>
@@ -569,7 +609,7 @@ function getWebInterface() {
         * Based on typical 2000x3000px manhwa page (original ~900KB)
       </p>
     </div>
-
+    
     <div class="section">
       <h2>🔍 Response Headers</h2>
       <p style="margin-bottom: 15px;">Verify compression by checking these headers:</p>
@@ -581,7 +621,7 @@ function getWebInterface() {
         <li><code>X-Response-Time</code>: Total processing time in ms</li>
         <li><code>Content-Type</code>: image/webp or image/jpeg</li>
       </ul>
-
+      
       <h3 style="margin-top: 25px;">Debug Headers (when debug=1):</h3>
       <ul>
         <li><code>X-Debug-WSRV-URL</code>: Full wsrv.nl URL used</li>
@@ -589,7 +629,7 @@ function getWebInterface() {
         <li><code>X-Debug-Compressed-Size</code>: Compressed file size</li>
       </ul>
     </div>
-
+    
     <div class="section">
       <h2>💾 Bandwidth Savings Calculator</h2>
       <table>
@@ -623,12 +663,12 @@ function getWebInterface() {
         </tbody>
       </table>
     </div>
-
+    
     <div class="section">
       <h2>🧪 Testing</h2>
       <h3>Test with curl:</h3>
       <div class="endpoint">curl -I "${location.origin}/?url=https://picsum.photos/2000/3000&l=50&debug=1"</div>
-
+      
       <h3>What to look for:</h3>
       <ul>
         <li><code>content-type: image/webp</code> ✅</li>
@@ -642,4 +682,4 @@ function getWebInterface() {
 </html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
-}
+  }
