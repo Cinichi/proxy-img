@@ -435,8 +435,13 @@ function getWebInterface() {
 async function handleStats(env) {
   if (!env.KV_STATS) {
     return new Response(
-      JSON.stringify({ error: "KV_STATS not configured. Add KV binding in wrangler.toml" }, null, 2),
-      { status: 500, headers: { "Content-Type": "application/json" } }
+      `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/><title>⚠️ Stats Error</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:50px;background:#fee;">
+<h1>⚠️ KV_STATS Not Configured</h1>
+<p>Please add KV binding in wrangler.toml</p>
+</body></html>`,
+      { status: 500, headers: { "Content-Type": "text/html" } }
     );
   }
   
@@ -449,24 +454,278 @@ async function handleStats(env) {
   
   // Format bytes saved
   const bytesSavedMB = (stats.bytesSaved / (1024 * 1024)).toFixed(2);
-  const bytesSavedGB = (stats.bytesSaved / (1024 * 1024 * 1024)).toFixed(2);
+  const bytesSavedGB = (stats.bytesSaved / (1024 * 1024 * 1024)).toFixed(3);
   
-  const enrichedStats = {
-    ...stats,
-    cacheHitRate: `${cacheHitRate}%`,
-    compressionRate: `${compressionRate}%`,
-    bytesSavedMB: `${bytesSavedMB} MB`,
-    bytesSavedGB: `${bytesSavedGB} GB`,
-    uptime: new Date().toISOString()
-  };
+  // Format date
+  const lastReset = new Date(stats.lastReset).toLocaleString();
+  const now = new Date().toLocaleString();
   
-  return new Response(JSON.stringify(enrichedStats, null, 2), {
-    headers: { 
-      "Content-Type": "application/json", 
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "no-cache"
-    },
-  });
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>📊 Proxy Statistics</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 20px;
+      padding: 40px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    }
+    h1 {
+      color: #667eea;
+      margin-bottom: 10px;
+      font-size: 2.5em;
+      text-align: center;
+    }
+    .subtitle {
+      text-align: center;
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 1.1em;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 20px;
+      margin: 30px 0;
+    }
+    .stat-card {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 30px;
+      border-radius: 15px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(102, 126, 234, 0.3);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .stat-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 15px 40px rgba(102, 126, 234, 0.4);
+    }
+    .stat-number {
+      font-size: 3em;
+      font-weight: bold;
+      margin-bottom: 10px;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+    }
+    .stat-label {
+      font-size: 1.1em;
+      opacity: 0.95;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .stat-sublabel {
+      font-size: 0.9em;
+      opacity: 0.8;
+      margin-top: 5px;
+    }
+    .highlight-card {
+      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    }
+    .warning-card {
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    }
+    .info-card {
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    }
+    .section {
+      background: #f8f9fa;
+      padding: 25px;
+      border-radius: 15px;
+      margin: 25px 0;
+    }
+    .section h2 {
+      color: #333;
+      margin-bottom: 15px;
+      font-size: 1.5em;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 12px 0;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .info-row:last-child {
+      border-bottom: none;
+    }
+    .info-label {
+      font-weight: 600;
+      color: #555;
+    }
+    .info-value {
+      color: #667eea;
+      font-weight: bold;
+    }
+    .back-button {
+      display: inline-block;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 15px 30px;
+      border-radius: 10px;
+      text-decoration: none;
+      font-weight: bold;
+      margin-top: 20px;
+      transition: transform 0.2s;
+    }
+    .back-button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+    }
+    .progress-bar {
+      background: #e0e0e0;
+      border-radius: 10px;
+      height: 20px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+      height: 100%;
+      border-radius: 10px;
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 0.85em;
+      font-weight: bold;
+    }
+    @media (max-width: 768px) {
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+      h1 {
+        font-size: 2em;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📊 Proxy Statistics</h1>
+    <p class="subtitle">Live performance metrics • Updated: ${now}</p>
+    
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-number">${stats.requests.toLocaleString()}</div>
+        <div class="stat-label">Total Requests</div>
+      </div>
+      
+      <div class="stat-card highlight-card">
+        <div class="stat-number">${bytesSavedGB} GB</div>
+        <div class="stat-label">Bandwidth Saved</div>
+        <div class="stat-sublabel">${bytesSavedMB} MB</div>
+      </div>
+      
+      <div class="stat-card info-card">
+        <div class="stat-number">${cacheHitRate}%</div>
+        <div class="stat-label">Cache Hit Rate</div>
+        <div class="stat-sublabel">${stats.cacheHits.toLocaleString()} hits / ${stats.cacheMisses.toLocaleString()} misses</div>
+      </div>
+      
+      <div class="stat-card">
+        <div class="stat-number">${stats.compressed.toLocaleString()}</div>
+        <div class="stat-label">Images Compressed</div>
+        <div class="stat-sublabel">${compressionRate}% of requests</div>
+      </div>
+      
+      <div class="stat-card">
+        <div class="stat-number">${stats.directFetch.toLocaleString()}</div>
+        <div class="stat-label">Direct Fetches</div>
+        <div class="stat-sublabel">Fallback mode</div>
+      </div>
+      
+      <div class="stat-card warning-card">
+        <div class="stat-number">${stats.wsrvBlocked.toLocaleString()}</div>
+        <div class="stat-label">wsrv.nl Blocks</div>
+        <div class="stat-sublabel">403 errors</div>
+      </div>
+      
+      <div class="stat-card warning-card">
+        <div class="stat-number">${stats.directFailed.toLocaleString()}</div>
+        <div class="stat-label">Failed Fetches</div>
+        <div class="stat-sublabel">All attempts failed</div>
+      </div>
+      
+      <div class="stat-card warning-card">
+        <div class="stat-number">${stats.errors.toLocaleString()}</div>
+        <div class="stat-label">Fatal Errors</div>
+        <div class="stat-sublabel">Worker errors</div>
+      </div>
+    </div>
+    
+    <div class="section">
+      <h2>📈 Performance Metrics</h2>
+      
+      <div class="info-row">
+        <span class="info-label">Cache Hit Rate</span>
+        <span class="info-value">${cacheHitRate}%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width: ${cacheHitRate}%">${cacheHitRate}%</div>
+      </div>
+      
+      <div class="info-row" style="margin-top: 20px;">
+        <span class="info-label">Compression Rate</span>
+        <span class="info-value">${compressionRate}%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width: ${compressionRate}%">${compressionRate}%</div>
+      </div>
+      
+      <div class="info-row" style="margin-top: 20px;">
+        <span class="info-label">Success Rate</span>
+        <span class="info-value">${(((stats.compressed + stats.directFetch) / total * 100) || 0).toFixed(1)}%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width: ${(((stats.compressed + stats.directFetch) / total * 100) || 0).toFixed(1)}%">
+          ${(((stats.compressed + stats.directFetch) / total * 100) || 0).toFixed(1)}%
+        </div>
+      </div>
+    </div>
+    
+    <div class="section">
+      <h2>ℹ️ System Information</h2>
+      <div class="info-row">
+        <span class="info-label">Stats Since</span>
+        <span class="info-value">${lastReset}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Current Time</span>
+        <span class="info-value">${now}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Worker Version</span>
+        <span class="info-value">v1.2 (KV Stats)</span>
+      </div>
+    </div>
+    
+    <center>
+      <a href="/" class="back-button">← Back to Home</a>
+      <a href="/stats" class="back-button" style="margin-left: 10px;">🔄 Refresh Stats</a>
+    </center>
+  </div>
+</body>
+</html>`,
+    {
+      headers: { 
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache"
+      },
+    }
+  );
 }
 
 async function incrementKVStat(env, key) {
