@@ -204,17 +204,23 @@ async function addKVBytesSaved(env, bytes) {
 }
 
 async function getFreshStats(env) {
-  const raw = await env.KV_STATS.get("stats", { type: "json", cacheTtl: 0 });
-  if (raw) return raw;
-  const init = {
-    requests: 0,
-    cacheHits: 0,
-    cacheMisses: 0,
-    bytesSaved: 0,
-    lastReset: new Date().toISOString(),
-  };
-  await saveStats(env, init);
-  return init;
+  try {
+    const raw = await env.KV_STATS.get("stats", { type: "json", cacheTtl: 60 });
+    if (raw) return raw;
+
+    const init = {
+      requests: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      bytesSaved: 0,
+      lastReset: new Date().toISOString(),
+    };
+    await saveStats(env, init);
+    return init;
+  } catch (err) {
+    console.error("❌ KV GET failed:", err);
+    throw new Error(`KV GET failed: ${err.message}`);
+  }
 }
 
 async function saveStats(env, stats) {
@@ -276,4 +282,5 @@ h1{color:#4f46e5}
 <p style="margin-top:25px;color:#666">Auto-saves stats in Cloudflare KV. Refresh to update.</p>
 </div></body></html>`;
 }
+
 
