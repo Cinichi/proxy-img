@@ -2,8 +2,10 @@ name = "proxy-img"
 main = "src/index.js"
 compatibility_date = "2025-10-12"
 
-# Worker configuration
 workers_dev = true
+
+[observability]
+enabled = true
 
 [observability.logs]
 enabled = true
