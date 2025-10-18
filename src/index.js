@@ -589,8 +589,9 @@ async function showStatsJSON(env) {
   const total = data.requests || 1;
   const enriched = {
     ...data,
-    cacheHitRate: ((data.cacheHits / total) * 100).toFixed(1) + "%",
-    compressionRate: ((data.compressed / total) * 100).toFixed(1) + "%",
+    cacheHitRate: safePercent(data.cacheHits, total) + "%",
+    compressionRate: safePercent(data.compressed, total) + "%",
+    successRate: safePercent((data.compressed || 0) + (data.directFetch || 0), total) + "%",
     successRate: (((data.compressed + data.directFetch) / total) * 100).toFixed(1) + "%",
     bytesSavedMB: (data.bytesSaved / (1024 * 1024)).toFixed(2) + " MB",
     bytesSavedGB: (data.bytesSaved / (1024 * 1024 * 1024)).toFixed(3) + " GB",
@@ -626,9 +627,14 @@ async function showStatsPage(env) {
   };
   
   const total = data.requests || 1;
-  const hitRate = ((data.cacheHits / total) * 100).toFixed(1);
-  const compressionRate = ((data.compressed / total) * 100).toFixed(1);
-  const successRate = (((data.compressed + data.directFetch) / total) * 100).toFixed(1);
+function safePercent(num, den) {
+  if (!num || !den || den === 0 || isNaN(num) || isNaN(den)) return 0;
+  return ((num / den) * 100).toFixed(1);
+}
+
+  const hitRate = safePercent(data.cacheHits, total);
+  const compressionRate = safePercent(data.compressed, total);
+  const successRate = safePercent((data.compressed || 0) + (data.directFetch || 0), total);
   const savedMB = (data.bytesSaved / (1024 * 1024)).toFixed(2);
   const savedGB = (data.bytesSaved / (1024 * 1024 * 1024)).toFixed(3);
   const queueStats = wsrvQueue.getStats();
@@ -1097,3 +1103,4 @@ function addHeaders(response, startTime, cacheStatus, quality, compressionRatio 
     headers 
   });
 }
+
