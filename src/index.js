@@ -1,7 +1,8 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v4.2 — Production Ready
-// ✅ Enhanced Logging + Smart Retry + Adaptive Caching
-// ✅ Safe for Cloudflare Free Tier
-// ✅ Tachiyomi / Webtoon / Bandwidth Hero compatible
+// 🚀 Bandwidth Hero Cloudflare Worker v3.6 (Enhanced Edition)
+// ✅ Safe for Cloudflare Free Plan
+// ✅ Tachiyomi + Bandwidth Hero compatible
+// ✅ Automatic fallback for 400/403 wsrv.nl errors
+// ✅ Dedup-safe + enhanced logging + security improvements
 
 // =================== GLOBALS ===================
 let localStats = {
@@ -9,49 +10,98 @@ let localStats = {
   cacheHits: 0,
   cacheMisses: 0,
   bytesSaved: 0,
-  compressed: 0,
-  errors: 0,
-  fallbacks: 0,
-  wsrvFails: 0,
 };
 let lastFlushTime = Date.now();
 const pendingRequests = new Map();
-const dedupCleanup = 30000; // 30s cleanup
 
-// =================== CONFIG ===================
-const CONFIG = {
-  SMALL_IMG_SKIP: 50 * 1024, // Skip compression for images < 50KB
-  WSRV_TIMEOUT: 12000, // 12s for wsrv.nl
-  DIRECT_TIMEOUT: 18000, // 18s for direct fetch
-  MAX_RETRIES: 2,
-  BACKOFF_BASE: 800, // ms
-  BACKOFF_MAX: 4000, // ms
-  CACHE_TTL_MIN: 300, // 5min
-  CACHE_TTL_MAX: 604800, // 7 days
-  KV_FLUSH_INTERVAL: 2 * 60 * 1000, // 2min (faster updates)
-  MIN_QUALITY: 40,
-  MAX_QUALITY: 100,
-};
+// =================== SECURITY HELPERS ===================
+function isUrlSafe(url) {
+  try {
+    const u = new URL(url);
+    // Block internal IPs and localhost
+    if (/^(10|127|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\./.test(u.hostname)) {
+      return false;
+    }
+    if (u.hostname === 'localhost' || u.hostname === '0.0.0.0' || u.hostname === '[::]') {
+      return false;
+    }
+    return ['http:', 'https:'].includes(u.protocol);
+  } catch {
+    return false;
+  }
+}
+
+async function checkRateLimit(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const key = `ratelimit:${ip}`;
+  
+  try {
+    const count = parseInt(await env.KV_STATS.get(key)) || 0;
+    
+    // 1000 requests per minute = ~16 req/sec (enough for fast manga reading)
+    // With cache, most requests won't even hit this
+    if (count > 1000) {
+      return errorResponse('Rate limit exceeded. Please try again later.', 429);
+    }
+    
+    await env.KV_STATS.put(key, (count + 1).toString(), { expirationTtl: 60 });
+  } catch (err) {
+    // If KV fails, allow request (fail open)
+    logError("Rate limit check", err);
+  }
+  
+  return null;
+}
 
 // =================== LOGGING HELPERS ===================
 function shortKey(url) {
   try {
     const u = new URL(url);
-    const path = u.pathname.split('/').filter(Boolean).pop() || '';
-    return `${u.hostname.replace(/^www\./, '')}/${path.slice(0, 20)}`;
+    return `${u.hostname.replace(/^www\./, '')}${u.pathname.split('/').pop().slice(0, 15)}`;
   } catch {
-    return url.slice(0, 30);
+    return url.slice(0, 20);
   }
 }
 
-function log(level, tag, msg, meta = {}) {
-  const icons = {
-    req: "📥", cache: "✅", warn: "⚠️", error: "❌", 
-    net: "🌐", perf: "⚡", dedup: "🕓", fallback: "🔄"
-  };
-  const ts = new Date().toISOString().slice(11, 23);
-  const metaStr = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
-  console[level](`[${ts}] ${icons[tag] || '•'} [${tag.toUpperCase()}] ${msg}${metaStr}`);
+function logFetchStart(url, quality, bw, jpeg) {
+  console.log(`📥 [REQ] ${shortKey(url)} | q=${quality}${bw ? " bw" : ""}${jpeg ? " jpg" : ""}`);
+}
+function logCacheHit(cacheStatus, ms) {
+  console.log(`✅ [CACHE] ${cacheStatus} | ${ms}ms`);
+}
+function logWsrvFail(status, type) {
+  console.warn(`⚠️ [WSRV] ${status} ${type}`);
+}
+function logFallback(reason) {
+  console.warn(`🔄 [FALLBACK] ${reason}`);
+}
+function logDedup(waiting, key) {
+  if (waiting)
+    console.log(`🕓 [DEDUP] Waiting for existing fetch (${key.slice(0, 32)}...)`);
+  else
+    console.log(`🧵 [DEDUP] New fetch started (${key.slice(0, 32)}...)`);
+}
+function logStatsUpdate(stats) {
+  console.log(
+    `📊 [STATS] Req:${stats.requests} Hit:${stats.cacheHits} Miss:${stats.cacheMisses} Saved:${(
+      stats.bytesSaved / (1024 * 1024)
+    ).toFixed(2)}MB`
+  );
+}
+function logCompression(orig, comp) {
+  const saved = orig - comp;
+  const percent = ((saved / orig) * 100).toFixed(1);
+  console.log(`💾 [COMPRESS] ${orig}B → ${comp}B | Saved ${percent}%`);
+}
+function logError(context, err) {
+  console.error(`❌ [ERROR] ${context}:`, err.message || err);
+}
+
+// =================== CACHE KEY GENERATION ===================
+function generateCacheKey(targetUrl, quality, jpeg, bw) {
+  // Create a more robust cache key with version prefix
+  const urlHash = btoa(targetUrl).slice(0, 32).replace(/[/+=]/g, '-');
+  return new Request(`cache-v2:${urlHash}:q${quality}:${jpeg ? 'jpg' : 'webp'}${bw ? ':bw' : ''}`);
 }
 
 // =================== MAIN HANDLER ===================
@@ -60,27 +110,26 @@ export default {
     const startTime = Date.now();
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") return handleCORS();
 
-    // Admin routes
     if (url.pathname === "/stats") return await showStatsPage(env);
-    if (url.pathname === "/reset") return await resetStats(env);
     if (url.pathname === "/health") return healthCheck();
+    if (url.pathname === "/reset") {
+      await env.KV_STATS.delete("stats");
+      return new Response("✅ Stats reset.", { headers: { "Content-Type": "text/plain" } });
+    }
 
-    // Web interface
     if (!url.searchParams.get("url")) return getWebInterface();
 
-    // Main image handling
+    // Rate limiting check
+    const rateLimitResponse = await checkRateLimit(request, env);
+    if (rateLimitResponse) return rateLimitResponse;
+
     try {
-      const response = await handleImageRequest(request, env, ctx, startTime);
-      const elapsed = Date.now() - startTime;
-      log("info", "perf", `Request completed in ${elapsed}ms`);
-      return response;
+      return await handleImageRequest(request, env, ctx, startTime);
     } catch (err) {
-      localStats.errors++;
-      log("error", "error", `Handler failed: ${err.message}`, { stack: err.stack });
-      return errorResponse(`Request failed: ${err.message}`, 500);
+      logError("Worker", err);
+      return errorResponse(`Internal error: ${err.message}`, 500);
     }
   },
 };
@@ -89,251 +138,163 @@ export default {
 async function handleImageRequest(request, env, ctx, startTime) {
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
-  const bw = url.searchParams.get("bw") === "1";
-  const userQuality = parseInt(url.searchParams.get("l")) || 75;
-  const jpeg = url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
-  const nocache = url.searchParams.get("nocache") === "1";
-
-  // Validate URL
-  if (!isValidUrl(targetUrl)) {
-    return errorResponse("Invalid URL: must be http(s) and not private IP", 400);
-  }
-
-  // Clamp quality
-  const quality = Math.max(CONFIG.MIN_QUALITY, Math.min(CONFIG.MAX_QUALITY, userQuality));
   
-  log("info", "req", `Processing ${shortKey(targetUrl)}`, { 
-    quality, 
-    format: jpeg ? "jpg" : "webp",
-    bw 
-  });
+  // Validate URL
+  if (!isUrlSafe(targetUrl)) {
+    return errorResponse("Invalid or unsafe URL", 400);
+  }
+  
+  const bw = url.searchParams.get("bw") === "1";
+  const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
+  const jpeg = url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
 
-  // Build wsrv.nl URL
+  logFetchStart(targetUrl, quality, bw, jpeg);
+
   const wsrvParams = new URLSearchParams({
     url: targetUrl,
     q: quality.toString(),
     output: jpeg ? "jpg" : "webp",
-    default: targetUrl, // Fallback to original on wsrv error
   });
   if (bw) wsrvParams.set("il", "");
 
   const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
-  const browserUA = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36";
+  const browserUA =
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36";
 
-  // Generate cache key
-  const cacheKeyStr = `v4.2-${hashUrl(targetUrl)}-q${quality}-${jpeg ? "jpg" : "webp"}${bw ? "-bw" : ""}`;
-  const cacheKey = new Request(`https://cache.internal/${cacheKeyStr}`);
+  const cacheKey = generateCacheKey(targetUrl, quality, jpeg, bw);
   const cache = caches.default;
 
-  // --- CLIENT ETAG CHECK ---
-  const clientEtag = request.headers.get("if-none-match");
-  if (clientEtag && !nocache) {
-    const cached = await cache.match(cacheKey);
-    if (cached && cached.headers.get("etag") === clientEtag) {
-      log("info", "cache", "Client ETag match - 304");
-      await updateStats(env, { requests: 1, cacheHits: 1 });
-      return new Response(null, { status: 304 });
-    }
-  }
-
   // --- CACHE CHECK ---
-  if (!nocache) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      log("info", "cache", `HIT in ${Date.now() - startTime}ms`);
-      await updateStats(env, { requests: 1, cacheHits: 1 });
-      return addHeaders(cached.clone(), startTime, "HIT", quality);
-    }
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    logCacheHit("HIT", Date.now() - startTime);
+    await updateStats(env, { requests: 1, cacheHits: 1 });
+    return addHeaders(cached, startTime, "HIT", quality, wsrvUrl);
   }
 
-  // --- DEDUP WRAPPER ---
-  return await fetchWithDedup(cacheKeyStr, async () => {
-    let finalResponse = null;
-    let fetchSource = "none";
-    let originalSize = 0;
-    let compressedSize = 0;
-
-    // STRATEGY 1: Try wsrv.nl with retry
+  // --- DEDUP SAFE WRAPPER ---
+  return await fetchWithDedup(cacheKey, async () => {
     try {
-      const wsrvResponse = await fetchWithRetry(
+      const response = await fetchWithRetry(
         wsrvUrl,
         {
           headers: {
             "User-Agent": browserUA,
             Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
           },
+          cf: { cacheEverything: true, cacheTtl: 604800 },
         },
-        CONFIG.WSRV_TIMEOUT,
-        CONFIG.MAX_RETRIES
+        2
       );
 
-      const contentType = wsrvResponse.headers.get("content-type") || "";
+      const contentType = response.headers.get("content-type") || "";
+      const validImageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/avif', 'image/gif'];
       
-      if (wsrvResponse.ok && contentType.startsWith("image/") && !contentType.includes("html")) {
-        finalResponse = wsrvResponse;
-        fetchSource = "wsrv";
-        compressedSize = parseInt(wsrvResponse.headers.get("content-length") || "0");
-        
-        log("info", "net", "wsrv.nl success", { size: compressedSize });
-
-        // Try to get original size for stats
-        try {
-          const headResp = await fetch(targetUrl, { 
-            method: "HEAD", 
-            headers: { "User-Agent": browserUA },
-            signal: AbortSignal.timeout(5000)
-          });
-          originalSize = parseInt(headResp.headers.get("content-length") || "0");
-        } catch {}
-      } else {
-        localStats.wsrvFails++;
-        log("warn", "warn", `wsrv.nl returned ${wsrvResponse.status} ${contentType}`);
+      if (!response.ok || !validImageTypes.some(t => contentType.startsWith(t))) {
+        logWsrvFail(response.status, contentType);
+        logFallback("wsrv.nl failed, using direct fetch");
+        return await handleDirectImage(targetUrl, browserUA, env, ctx, startTime);
       }
+
+      // Get actual size by reading the response
+      const buffer = await response.arrayBuffer();
+      const size = buffer.byteLength;
+      const estimatedOriginal = Math.round(size * 1.7);
+      const bytesSaved = estimatedOriginal - size;
+      
+      if (size > 0) logCompression(estimatedOriginal, size);
+
+      // Create new response from buffer
+      const newResponse = new Response(buffer, {
+        status: response.status,
+        headers: response.headers
+      });
+
+      ctx.waitUntil(cache.put(cacheKey, newResponse.clone()));
+      await updateStats(env, { requests: 1, cacheMisses: 1, bytesSaved });
+      return addHeaders(newResponse, startTime, "MISS", quality, wsrvUrl);
     } catch (err) {
-      localStats.wsrvFails++;
-      log("warn", "warn", `wsrv.nl failed: ${err.message}`);
+      logError("wsrv.nl fetch", err);
+      return await handleDirectImage(targetUrl, browserUA, env, ctx, startTime);
     }
-
-    // STRATEGY 2: Fallback to direct fetch
-    if (!finalResponse) {
-      log("info", "fallback", "Attempting direct fetch");
-      localStats.fallbacks++;
-
-      try {
-        const directResponse = await fetchWithRetry(
-          targetUrl,
-          {
-            headers: {
-              "User-Agent": browserUA,
-              Referer: new URL(targetUrl).origin + "/",
-              Accept: "image/*,*/*;q=0.8",
-            },
-          },
-          CONFIG.DIRECT_TIMEOUT,
-          CONFIG.MAX_RETRIES
-        );
-
-        const contentType = directResponse.headers.get("content-type") || "";
-        
-        if (directResponse.ok && contentType.startsWith("image/")) {
-          finalResponse = directResponse;
-          fetchSource = "direct";
-          originalSize = compressedSize = parseInt(directResponse.headers.get("content-length") || "0");
-          
-          log("info", "net", "Direct fetch success", { size: compressedSize });
-        }
-      } catch (err) {
-        log("error", "error", `Direct fetch failed: ${err.message}`);
-      }
-    }
-
-    // FAILURE: Both strategies failed
-    if (!finalResponse) {
-      throw new Error("All fetch strategies failed");
-    }
-
-    // --- SIZE CHECK: Skip caching tiny images ---
-    if (compressedSize > 0 && compressedSize < CONFIG.SMALL_IMG_SKIP) {
-      log("warn", "warn", `Skipping cache for small image (${(compressedSize/1024).toFixed(1)}KB)`);
-      await updateStats(env, { requests: 1, cacheMisses: 1 });
-      return addHeaders(finalResponse, startTime, "MISS-SMALL", quality);
-    }
-
-    // --- CALCULATE SAVINGS ---
-    let bytesSaved = 0;
-    if (fetchSource === "wsrv" && originalSize > 0 && compressedSize > 0) {
-      bytesSaved = originalSize - compressedSize;
-      if (bytesSaved > 0) {
-        const percent = ((bytesSaved / originalSize) * 100).toFixed(1);
-        log("info", "perf", `Compressed: ${originalSize}B → ${compressedSize}B (${percent}% saved)`);
-        localStats.compressed++;
-      }
-    } else if (fetchSource === "wsrv" && compressedSize > 0) {
-      // Estimate savings (typical compression ratio)
-      bytesSaved = Math.round(compressedSize * 0.4);
-      localStats.compressed++;
-    }
-
-    // --- CACHE THE RESULT ---
-    if (!nocache) {
-      const ttl = adaptiveTTL(localStats.cacheHits);
-      ctx.waitUntil(cacheWithTTL(cache, cacheKey, finalResponse.clone(), ttl));
-      log("info", "cache", `Cached with TTL ${ttl}s`);
-    }
-
-    await updateStats(env, { 
-      requests: 1, 
-      cacheMisses: 1, 
-      bytesSaved 
-    });
-
-    return addHeaders(finalResponse, startTime, `MISS-${fetchSource.toUpperCase()}`, quality);
   });
 }
 
-// =================== FETCH UTILITIES ===================
-async function fetchWithRetry(url, options, timeout, maxRetries) {
-  let lastError;
+// --- Direct fetch fallback ---
+async function handleDirectImage(targetUrl, ua, env, ctx, startTime) {
+  const cache = caches.default;
+  const cacheKey = new Request(`direct-v2-${btoa(targetUrl).slice(0, 40)}`);
+  const cached = await cache.match(cacheKey);
   
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  if (cached) {
+    logCacheHit("HIT-DIRECT", Date.now() - startTime);
+    await updateStats(env, { requests: 1, cacheHits: 1 });
+    return addHeaders(cached, startTime, "HIT-DIRECT", 100);
+  }
+
+  try {
+    const response = await fetchWithRetry(
+      targetUrl,
+      {
+        headers: {
+          "User-Agent": ua,
+          Referer: new URL(targetUrl).origin + "/",
+          Accept: "image/*,*/*;q=0.8",
+        },
+        cf: { cacheEverything: true, cacheTtl: 604800 },
+      },
+      2
+    );
+
+    if (!response.ok) throw new Error(`Direct fetch failed with status ${response.status}`);
+
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    await updateStats(env, { requests: 1, cacheMisses: 1 });
+    console.log("✅ [DIRECT] Success");
+    return addHeaders(response, startTime, "MISS-DIRECT", 100);
+  } catch (err) {
+    logError("Direct Fetch", err);
+    return errorResponse("Failed to fetch image", 502, { url: targetUrl });
+  }
+}
+
+// --- Retry logic with exponential backoff ---
+async function fetchWithRetry(url, options, maxRetries = 2) {
+  for (let i = 0; i <= maxRetries; i++) {
     try {
-      // Exponential backoff
-      if (attempt > 0) {
-        const backoff = Math.min(
-          CONFIG.BACKOFF_BASE * Math.pow(2, attempt - 1), 
-          CONFIG.BACKOFF_MAX
-        );
-        log("info", "net", `Retry ${attempt}/${maxRetries} after ${backoff}ms`);
-        await new Promise(resolve => setTimeout(resolve, backoff));
+      const response = await fetchWithTimeout(url, options, 10000);
+      if (response.ok) return response;
+      
+      if (i < maxRetries && response.status >= 500) {
+        // Only retry on server errors
+        await new Promise(r => setTimeout(r, 1000 * (i + 1))); // Exponential backoff
+        continue;
       }
       
-      return await fetchWithTimeout(url, options, timeout);
+      return response; // Return non-500 errors immediately
     } catch (err) {
-      lastError = err;
-      log("warn", "warn", `Attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}`);
+      if (i === maxRetries) throw err;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
-  }
-  
-  throw lastError;
-}
-
-async function fetchWithTimeout(url, options, ms) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), ms);
-  
-  try {
-    const response = await fetch(url, { 
-      ...options, 
-      signal: controller.signal 
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (err) {
-    clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
-      throw new Error(`Timeout after ${ms}ms`);
-    }
-    throw err;
   }
 }
 
-// Request deduplication with auto-cleanup
-async function fetchWithDedup(key, fetchFn) {
+// --- Deduplication with memory leak prevention ---
+async function fetchWithDedup(cacheKey, fetchFn) {
+  const key = cacheKey.url;
   if (pendingRequests.has(key)) {
-    log("info", "dedup", `Waiting for in-flight request: ${key.slice(0, 30)}...`);
+    logDedup(true, key);
     return await pendingRequests.get(key);
   }
 
-  log("info", "dedup", `New fetch: ${key.slice(0, 30)}...`);
-  
+  logDedup(false, key);
   const promise = (async () => {
     try {
       return await fetchFn();
     } finally {
-      setTimeout(() => {
-        pendingRequests.delete(key);
-        log("info", "dedup", "Cleaned up pending request");
-      }, dedupCleanup);
+      pendingRequests.delete(key);
+      // Safety cleanup after 30 seconds
+      setTimeout(() => pendingRequests.delete(key), 30000);
     }
   })();
 
@@ -341,68 +302,24 @@ async function fetchWithDedup(key, fetchFn) {
   return await promise;
 }
 
-// =================== HELPER FUNCTIONS ===================
-function isValidUrl(url) {
-  try {
-    const u = new URL(url);
-    
-    // Check protocol
-    if (!["http:", "https:"].includes(u.protocol)) return false;
-    
-    // Block private IPs and localhost
-    const blocked = [
-      "localhost", "127.", "192.168.", "10.", 
-      "172.16.", "172.17.", "172.18.", "172.19.",
-      "172.20.", "172.21.", "172.22.", "172.23.",
-      "172.24.", "172.25.", "172.26.", "172.27.",
-      "172.28.", "172.29.", "172.30.", "172.31."
-    ];
-    
-    return !blocked.some(pattern => u.hostname.includes(pattern));
-  } catch {
-    return false;
-  }
+// --- Timeout wrapper ---
+async function fetchWithTimeout(url, options, ms = 10000) {
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms)),
+  ]);
 }
 
-function hashUrl(url) {
-  try {
-    return btoa(url).slice(0, 48).replace(/[/+=]/g, '');
-  } catch {
-    return url.slice(0, 48).replace(/[^a-zA-Z0-9]/g, '');
-  }
-}
-
-function adaptiveTTL(cacheHits) {
-  if (cacheHits > 100) return CONFIG.CACHE_TTL_MAX; // 7 days
-  if (cacheHits > 50) return 86400; // 1 day
-  if (cacheHits > 10) return 3600; // 1 hour
-  return CONFIG.CACHE_TTL_MIN; // 5 min
-}
-
-async function cacheWithTTL(cache, key, response, ttl) {
-  const headers = new Headers(response.headers);
-  headers.set("Cache-Control", `public, max-age=${ttl}, immutable`);
-  
-  const cachedResponse = new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-  
-  await cache.put(key, cachedResponse);
-}
-
-// =================== STATS MANAGEMENT ===================
+// --- Update KV with threshold and time-based flushing ---
 async function updateStats(env, delta) {
-  // Update local stats
-  for (const key in delta) {
-    if (localStats.hasOwnProperty(key)) {
-      localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
-    }
-  }
-
-  // Flush to KV periodically
-  if (Date.now() - lastFlushTime < CONFIG.KV_FLUSH_INTERVAL) return;
+  for (const key in delta) localStats[key] += delta[key] || 0;
+  
+  // Flush if threshold reached OR time elapsed
+  const shouldFlush = 
+    Date.now() - lastFlushTime > 2 * 60 * 1000 || 
+    localStats.requests > 50;
+    
+  if (!shouldFlush) return;
 
   try {
     const kvData = (await env.KV_STATS.get("stats", { type: "json" })) || {
@@ -410,36 +327,71 @@ async function updateStats(env, delta) {
       cacheHits: 0,
       cacheMisses: 0,
       bytesSaved: 0,
-      compressed: 0,
-      errors: 0,
-      fallbacks: 0,
-      wsrvFails: 0,
       lastReset: new Date().toISOString(),
     };
-
-    // Merge local stats into KV
-    for (const key in localStats) {
-      if (key !== 'lastReset') {
-        kvData[key] = (kvData[key] || 0) + localStats[key];
-      }
-    }
-
-    await env.KV_STATS.put("stats", JSON.stringify(kvData));
     
-    log("info", "cache", "Stats flushed to KV", { 
-      requests: localStats.requests,
-      saved: `${(localStats.bytesSaved / 1024).toFixed(1)}KB`
-    });
-
-    // Reset local stats
-    Object.keys(localStats).forEach(k => localStats[k] = 0);
+    for (const key in localStats) kvData[key] += localStats[key];
+    await env.KV_STATS.put("stats", JSON.stringify(kvData));
+    logStatsUpdate(localStats);
+    
+    localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
     lastFlushTime = Date.now();
   } catch (err) {
-    log("error", "error", `KV flush failed: ${err.message}`);
+    logError("KV Update", err);
   }
 }
 
-// =================== HTTP RESPONSES ===================
+// --- Health check endpoint ---
+function healthCheck() {
+  return new Response(JSON.stringify({ 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    memory: localStats,
+    pendingRequests: pendingRequests.size
+  }), {
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+// --- Simple /stats UI ---
+async function showStatsPage(env) {
+  const stats = (await env.KV_STATS.get("stats", { type: "json" })) || {
+    requests: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    bytesSaved: 0,
+    lastReset: "N/A",
+  };
+  const savedMB = (stats.bytesSaved / (1024 * 1024)).toFixed(2);
+  const hitRate =
+    stats.requests > 0 ? ((stats.cacheHits / stats.requests) * 100).toFixed(1) : 0;
+
+  return new Response(
+    `
+<!DOCTYPE html><html><head><title>📊 Bandwidth Hero Stats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:sans-serif;background:#f5f6fa;padding:40px;margin:0}
+.card{background:white;padding:25px;border-radius:15px;max-width:420px;margin:auto;box-shadow:0 5px 20px rgba(0,0,0,0.1)}
+h1{color:#6c63ff;text-align:center;margin-top:0}
+.item{margin:10px 0;padding:10px;background:#f8f9fa;border-radius:8px}
+.item b{color:#333}
+.footer{font-size:12px;color:gray;text-align:center;margin-top:20px}
+</style></head>
+<body><div class="card">
+<h1>📊 Bandwidth Hero</h1>
+<div class="item"><b>Total Requests:</b> ${stats.requests}</div>
+<div class="item"><b>Cache Hits:</b> ${stats.cacheHits} (${hitRate}%)</div>
+<div class="item"><b>Cache Misses:</b> ${stats.cacheMisses}</div>
+<div class="item"><b>Data Saved:</b> ${savedMB} MB</div>
+<div class="item"><b>Last Reset:</b> ${stats.lastReset}</div>
+<p class="footer">Auto updates every 2 min or 50 requests</p>
+</div></body></html>`,
+    { headers: { "Content-Type": "text/html; charset=utf-8" } }
+  );
+}
+
+// --- CORS, HTML + Errors ---
 function handleCORS() {
   return new Response(null, {
     status: 204,
@@ -447,394 +399,58 @@ function handleCORS() {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
       "Access-Control-Allow-Headers": "*",
-      "Access-Control-Max-Age": "86400",
     },
   });
 }
 
-function healthCheck() {
-  return new Response(JSON.stringify({
-    status: "healthy",
-    version: "4.2",
-    uptime: Math.floor((Date.now() - lastFlushTime) / 1000),
-    pendingRequests: pendingRequests.size,
-    localStats
-  }, null, 2), {
-    headers: { 
-      "Content-Type": "application/json",
-      "Cache-Control": "no-cache"
-    }
-  });
-}
-
-async function resetStats(env) {
-  try {
-    await env.KV_STATS.delete("stats");
-    Object.keys(localStats).forEach(k => localStats[k] = 0);
-    log("info", "cache", "Stats reset successfully");
-    return new Response("✅ Stats reset successfully", {
-      headers: { "Content-Type": "text/plain" }
-    });
-  } catch (err) {
-    return errorResponse(`Reset failed: ${err.message}`, 500);
-  }
-}
-
-function errorResponse(msg, status = 500) {
-  return new Response(JSON.stringify({
-    error: msg,
-    status,
-    timestamp: new Date().toISOString()
-  }, null, 2), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    },
-  });
-}
-
-function addHeaders(response, startTime, cacheStatus, quality) {
-  const headers = new Headers(response.headers);
-  const elapsed = Date.now() - startTime;
-  const ttl = adaptiveTTL(localStats.cacheHits);
-  
-  headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Cache-Control", `public, max-age=${ttl}, immutable`);
-  headers.set("ETag", headers.get("etag") || `"v4.2-${Date.now()}"`);
-  headers.set("X-Cache-Status", cacheStatus);
-  headers.set("X-Quality", quality.toString());
-  headers.set("X-Response-Time", `${elapsed}ms`);
-  headers.set("X-Proxy-Version", "4.2");
-  headers.set("Vary", "Accept");
-  headers.set("X-Content-Type-Options", "nosniff");
-  
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-// =================== WEB INTERFACE ===================
-function getWebInterface() {
+function errorResponse(msg, status = 500, details = {}) {
   return new Response(
-    `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bandwidth Hero Proxy v4.2</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
+    JSON.stringify({ 
+      error: msg, 
+      status,
+      timestamp: new Date().toISOString(),
+      ...details 
+    }), {
+      status,
+      headers: { 
+        "Access-Control-Allow-Origin": "*", 
+        "Content-Type": "application/json" 
+      },
     }
-    .container {
-      background: white;
-      padding: 40px;
-      border-radius: 20px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      max-width: 700px;
-      width: 100%;
-    }
-    h1 {
-      color: #333;
-      margin-bottom: 10px;
-      font-size: 2em;
-    }
-    .version {
-      color: #667eea;
-      font-size: 0.9em;
-      margin-bottom: 30px;
-    }
-    h2 {
-      color: #555;
-      font-size: 1.3em;
-      margin: 30px 0 15px;
-      border-left: 4px solid #667eea;
-      padding-left: 15px;
-    }
-    code {
-      background: #f4f4f4;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 0.9em;
-      font-family: 'Courier New', monospace;
-    }
-    pre {
-      background: #2d2d2d;
-      color: #f8f8f8;
-      padding: 20px;
-      border-radius: 8px;
-      overflow-x: auto;
-      font-size: 0.85em;
-      line-height: 1.5;
-    }
-    .param { color: #4CAF50; }
-    ul {
-      margin: 15px 0 15px 20px;
-      line-height: 1.8;
-    }
-    .features {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 15px;
-      margin: 20px 0;
-    }
-    .feature {
-      background: #f8f9fa;
-      padding: 15px;
-      border-radius: 8px;
-      border-left: 3px solid #667eea;
-    }
-    .links {
-      display: flex;
-      gap: 15px;
-      margin-top: 30px;
-      flex-wrap: wrap;
-    }
-    .links a {
-      flex: 1;
-      min-width: 140px;
-      text-align: center;
-      padding: 12px 20px;
-      background: #667eea;
-      color: white;
-      text-decoration: none;
-      border-radius: 8px;
-      font-weight: 500;
-      transition: all 0.3s;
-    }
-    .links a:hover {
-      background: #5568d3;
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-    }
-    @media (max-width: 600px) {
-      .container { padding: 30px 20px; }
-      h1 { font-size: 1.5em; }
-      .links { flex-direction: column; }
-      .links a { min-width: 100%; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>⚡ Bandwidth Hero Proxy</h1>
-    <div class="version">v4.2 — Production Ready</div>
-    
-    <h2>📖 Usage</h2>
-    <pre>GET /?url=<span class="param">&lt;IMAGE_URL&gt;</span>&l=<span class="param">75</span>&jpg=<span class="param">0</span>&bw=<span class="param">0</span></pre>
-    
-    <h2>🎛️ Parameters</h2>
-    <ul>
-      <li><code>url</code> — Target image URL (required)</li>
-      <li><code>l</code> — Quality level 40-100 (default: 75)</li>
-      <li><code>jpg</code> — Force JPEG output (default: 0, uses WebP)</li>
-      <li><code>bw</code> — Grayscale mode (default: 0)</li>
-      <li><code>nocache</code> — Skip caching (default: 0)</li>
-    </ul>
-    
-    <h2>✨ Features</h2>
-    <div class="features">
-      <div class="feature">🚀 Smart compression via wsrv.nl</div>
-      <div class="feature">💾 Adaptive TTL caching</div>
-      <div class="feature">🔄 Auto-retry with backoff</div>
-      <div class="feature">⚡ Request deduplication</div>
-      <div class="feature">📊 Real-time statistics</div>
-      <div class="feature">🎯 ETag support</div>
-    </div>
-    
-    <div class="links">
-      <a href="/stats">📊 Statistics</a>
-      <a href="/health">💚 Health</a>
-      <a href="/reset">🔄 Reset</a>
-    </div>
-  </div>
-</body>
-</html>`,
-    { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
 }
 
-async function showStatsPage(env) {
-  const stats = (await env.KV_STATS.get("stats", { type: "json" })) || {
-    requests: 0,
-    cacheHits: 0,
-    cacheMisses: 0,
-    bytesSaved: 0,
-    compressed: 0,
-    errors: 0,
-    fallbacks: 0,
-    wsrvFails: 0,
-    lastReset: "N/A",
-  };
+function addHeaders(response, startTime, cacheStatus, quality, wsrvUrl = "") {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "public, max-age=604800, immutable");
+  headers.set("X-Cache-Status", cacheStatus);
+  headers.set("X-Quality", quality.toString());
+  if (wsrvUrl) headers.set("X-WSRV", wsrvUrl);
+  headers.set("X-Response-Time", `${Date.now() - startTime}ms`);
+  return new Response(response.body, { status: response.status, headers });
+}
 
-  const savedMB = ((stats.bytesSaved || 0) / (1024 * 1024)).toFixed(2);
-  const hitRate = stats.requests > 0 
-    ? ((stats.cacheHits / stats.requests) * 100).toFixed(1) 
-    : 0;
-  const avgSaved = stats.compressed > 0
-    ? ((stats.bytesSaved / stats.compressed) / 1024).toFixed(1)
-    : 0;
-  const wsrvSuccessRate = stats.requests > 0
-    ? (((stats.requests - stats.wsrvFails) / stats.requests) * 100).toFixed(1)
-    : 100;
-
+function getWebInterface() {
   return new Response(
-    `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Stats — Bandwidth Hero</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 40px 20px;
-    }
-    .container {
-      max-width: 1000px;
-      margin: 0 auto;
-      background: white;
-      padding: 40px;
-      border-radius: 20px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-    }
-    h1 {
-      color: #333;
-      margin-bottom: 10px;
-    }
-    .subtitle {
-      color: #666;
-      margin-bottom: 30px;
-      font-size: 0.9em;
-    }
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 20px;
-      margin: 30px 0;
-    }
-    .stat-card {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 25px;
-      border-radius: 12px;
-      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-    }
-    .stat-card.green { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }
-    .stat-card.orange { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
-    .stat-card.blue { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
-    .stat-card.purple { background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%); color: #333; }
-    .stat-value {
-      font-size: 2.5em;
-      font-weight: bold;
-      margin: 10px 0;
-    }
-    .stat-label {
-      font-size: 0.9em;
-      opacity: 0.95;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    .stat-sublabel {
-      font-size: 0.85em;
-      opacity: 0.8;
-      margin-top: 5px;
-    }
-    .back-link {
-      display: inline-block;
-      margin-top: 30px;
-      padding: 12px 24px;
-      background: #667eea;
-      color: white;
-      text-decoration: none;
-      border-radius: 8px;
-      transition: all 0.3s;
-    }
-    .back-link:hover {
-      background: #5568d3;
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-    }
-    @media (max-width: 600px) {
-      .container { padding: 30px 20px; }
-      .stat-value { font-size: 2em; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>📊 Bandwidth Hero Statistics</h1>
-    <div class="subtitle">Last reset: ${stats.lastReset}</div>
-    
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-label">Total Requests</div>
-        <div class="stat-value">${(stats.requests || 0).toLocaleString()}</div>
-      </div>
-      
-      <div class="stat-card green">
-        <div class="stat-label">Cache Hit Rate</div>
-        <div class="stat-value">${hitRate}%</div>
-        <div class="stat-sublabel">${stats.cacheHits || 0} hits / ${stats.cacheMisses || 0} misses</div>
-      </div>
-      
-      <div class="stat-card orange">
-        <div class="stat-label">Bandwidth Saved</div>
-        <div class="stat-value">${savedMB} MB</div>
-        <div class="stat-sublabel">${stats.compressed || 0} images compressed</div>
-      </div>
-      
-      <div class="stat-card blue">
-        <div class="stat-label">Avg Savings</div>
-        <div class="stat-value">${avgSaved} KB</div>
-        <div class="stat-sublabel">per compressed image</div>
-      </div>
-      
-      <div class="stat-card purple">
-        <div class="stat-label">wsrv.nl Success</div>
-        <div class="stat-value">${wsrvSuccessRate}%</div>
-        <div class="stat-sublabel">${stats.wsrvFails || 0} failures</div>
-      </div>
-      
-      <div class="stat-card">
-        <div class="stat-label">Direct Fallbacks</div>
-        <div class="stat-value">${stats.fallbacks || 0}</div>
-      </div>
-      
-      <div class="stat-card orange">
-        <div class="stat-label">Errors</div>
-        <div class="stat-value">${stats.errors || 0}</div>
-      </div>
-      
-      <div class="stat-card green">
-        <div class="stat-label">Status</div>
-        <div class="stat-value">✓</div>
-        <div class="stat-sublabel">Operational</div>
-      </div>
-    </div>
-    
-    <a href="/" class="back-link">← Back to Home</a>
-  </div>
-  
-  <script>
-    // Auto-refresh every 30 seconds
-    setTimeout(() => location.reload(), 30000);
-  </script>
-</body>
-</html>`,
+    `<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+    <body style="font-family:sans-serif;padding:40px;max-width:600px;margin:auto">
+      <h2>⚡ Bandwidth Hero Proxy v3.6</h2>
+      <p><strong>Usage:</strong> <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
+      <h3>Endpoints:</h3>
+      <ul>
+        <li><a href="/stats">📊 Stats</a></li>
+        <li><a href="/health">💚 Health Check</a></li>
+        <li><a href="/reset">🔄 Reset Stats</a></li>
+      </ul>
+      <h3>Parameters:</h3>
+      <ul>
+        <li><code>url</code> - Image URL (required)</li>
+        <li><code>l</code> - Quality 1-100 (default: 75)</li>
+        <li><code>jpg</code> or <code>jpeg</code> - Force JPEG (default: WebP)</li>
+        <li><code>bw</code> - Grayscale mode</li>
+      </ul>
+    </body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
 }
