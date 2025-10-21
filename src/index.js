@@ -19,7 +19,7 @@ function getRefererForHost(hostname) {
   }
 
   const map = {
-    "cdn.readdetectiveconan.com": "https://mangapiil.com/",
+    "cdn.readdetectiveconan.com": "https://mangapill.com/",
     "i2.hentaifox.com": "https://hentaifox.com/",
     "i3.hentaifox.com": "https://hentaifox.com/",
     "i9.nhentai.net": "https://nhentai.net/",
@@ -207,3 +207,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
