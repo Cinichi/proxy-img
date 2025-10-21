@@ -1,7 +1,8 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v3.5 (Optimized + Logging Edition)
+// 🚀 Bandwidth Hero Cloudflare Worker v3.6 (CDN Support + Referer Protection)
 // ✅ Safe for Cloudflare Free Plan
 // ✅ Tachiyomi + Bandwidth Hero compatible
 // ✅ Automatic fallback for 400/403 wsrv.nl errors
+// ✅ CDN domain mapping for manga sites
 // ✅ Dedup-safe + enhanced logging
 
 // =================== GLOBALS ===================
@@ -14,6 +15,37 @@ let localStats = {
 let lastFlushTime = Date.now();
 const pendingRequests = new Map();
 
+// =================== REFERER WHITELIST ===================
+// Add more domains here as needed
+const ALLOWED_REFERERS = [
+  'likemanga.ink',
+  'mangabuddy.com',
+  'mangapill.com',
+  'weebcentral.com',
+  'manhwaclan.com',
+  'mgeko.cc',
+  'mangareader.to',
+  // Add more domains below:
+  
+];
+
+// =================== CDN MAPPING ===================
+// Maps CDN domains to their parent sites for proper referer injection
+const CDN_TO_SITE_MAP = {
+  // Cloudflare CDN patterns
+  'images.mangabuddy.com': 'mangabuddy.com',
+  'cdn.likemanga.ink': 'likemanga.ink',
+  'img.mangapill.com': 'mangapill.com',
+  'cdn.weebcentral.com': 'weebcentral.com',
+  'cdn.manhwaclan.com': 'manhwaclan.com',
+  'img.mgeko.cc': 'mgeko.cc',
+  'cdn.mangareader.to': 'mangareader.to',
+  
+  // Generic CDN patterns (add specific mappings as you discover them)
+  // 'i0.wp.com': 'mangasite.com', // Example for WordPress CDN
+  // 'imgur.com': 'mangasite.com', // Example for Imgur hosting
+};
+
 // =================== LOGGING HELPERS ===================
 function shortKey(url) {
   try {
@@ -21,6 +53,60 @@ function shortKey(url) {
     return `${u.hostname.replace(/^www\./, '')}${u.pathname.split('/').pop().slice(0, 15)}`;
   } catch {
     return url.slice(0, 20);
+  }
+}
+
+// =================== REFERER VALIDATION ===================
+function isRefererAllowed(referer) {
+  if (!referer) return false;
+  try {
+    const refererHost = new URL(referer).hostname.replace(/^www\./, '').toLowerCase();
+    return ALLOWED_REFERERS.some(domain => 
+      refererHost === domain.toLowerCase() || refererHost.endsWith(`.${domain.toLowerCase()}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getSmartReferer(targetUrl) {
+  try {
+    const hostname = new URL(targetUrl).hostname.replace(/^www\./, '').toLowerCase();
+    
+    // Check if this is a known CDN domain
+    for (const [cdnDomain, parentSite] of Object.entries(CDN_TO_SITE_MAP)) {
+      if (hostname === cdnDomain.toLowerCase() || hostname.endsWith(`.${cdnDomain.toLowerCase()}`)) {
+        console.log(`🔗 [CDN] Mapped ${hostname} → ${parentSite}`);
+        return `https://${parentSite}/`;
+      }
+    }
+    
+    // Check if the hostname matches an allowed referer directly
+    const matchedDomain = ALLOWED_REFERERS.find(domain => 
+      hostname === domain.toLowerCase() || hostname.endsWith(`.${domain.toLowerCase()}`)
+    );
+    
+    if (matchedDomain) {
+      return `https://${matchedDomain}/`;
+    }
+    
+    // Fallback: try to detect common CDN patterns and guess parent domain
+    if (hostname.includes('cdn') || hostname.includes('img') || hostname.includes('images')) {
+      // Extract base domain (e.g., cdn.example.com → example.com)
+      const parts = hostname.split('.');
+      if (parts.length >= 2) {
+        const baseDomain = parts.slice(-2).join('.');
+        const possibleParent = ALLOWED_REFERERS.find(d => d.toLowerCase().includes(baseDomain));
+        if (possibleParent) {
+          console.log(`🔍 [AUTO-CDN] Detected ${hostname} → ${possibleParent}`);
+          return `https://${possibleParent}/`;
+        }
+      }
+    }
+    
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -74,6 +160,13 @@ export default {
 
     if (!url.searchParams.get("url")) return getWebInterface();
 
+    // =================== REFERER CHECK ===================
+    const referer = request.headers.get('Referer') || request.headers.get('Origin');
+    if (!isRefererAllowed(referer)) {
+      console.warn(`🚫 [BLOCKED] Invalid referer: ${referer || 'none'}`);
+      return errorResponse('Access denied: Invalid referer', 403);
+    }
+
     try {
       return await handleImageRequest(request, env, ctx, startTime);
     } catch (err) {
@@ -82,6 +175,7 @@ export default {
     }
   },
 };
+
 // =================== IMAGE HANDLING ===================
 async function handleImageRequest(request, env, ctx, startTime) {
   const url = new URL(request.url);
@@ -163,12 +257,13 @@ async function handleDirectImage(targetUrl, ua, env, ctx, startTime) {
   }
 
   try {
+    const smartReferer = getSmartReferer(targetUrl);
     const response = await fetchWithTimeout(
       targetUrl,
       {
         headers: {
           "User-Agent": ua,
-          Referer: new URL(targetUrl).origin + "/",
+          Referer: smartReferer || new URL(targetUrl).origin + "/",
           Accept: "image/*,*/*;q=0.8",
         },
         cf: { cacheEverything: true, cacheTtl: 604800 },
@@ -187,6 +282,7 @@ async function handleDirectImage(targetUrl, ua, env, ctx, startTime) {
     return errorResponse("Failed to fetch image", 502);
   }
 }
+
 // --- Deduplication with safety ---
 async function fetchWithDedup(cacheKey, fetchFn) {
   const key = cacheKey.url;
@@ -297,7 +393,7 @@ function addHeaders(response, startTime, cacheStatus, quality, wsrvUrl) {
   headers.set("Cache-Control", "public, max-age=604800, immutable");
   headers.set("X-Cache-Status", cacheStatus);
   headers.set("X-Quality", quality.toString());
-  headers.set("X-WSRV", wsrvUrl);
+  if (wsrvUrl) headers.set("X-WSRV", wsrvUrl);
   headers.set("X-Response-Time", `${Date.now() - startTime}ms`);
   return new Response(response.body, { status: response.status, headers });
 }
@@ -308,6 +404,11 @@ function getWebInterface() {
       <p>Use: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
       <p>Stats: <a href="/stats">/stats</a></p>
       <p>Reset: <a href="/reset">/reset</a></p>
+      <hr>
+      <h3>🔒 Protected Sites (${ALLOWED_REFERERS.length})</h3>
+      <ul>${ALLOWED_REFERERS.map(d => `<li>${d}</li>`).join('')}</ul>
+      <h3>🌐 CDN Mappings (${Object.keys(CDN_TO_SITE_MAP).length})</h3>
+      <ul>${Object.entries(CDN_TO_SITE_MAP).map(([cdn, site]) => `<li><code>${cdn}</code> → ${site}</li>`).join('')}</ul>
     </body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
