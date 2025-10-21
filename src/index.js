@@ -1,221 +1,209 @@
-// 🚀 Bandwidth Hero v3.7 — Cloudflare Safe Version
-// ✅ No global async/timers
-// ✅ Fixes Cloudflare Pages deploy error
-// ✅ KV-safe stats, Tachiyomi optimized
+// 🚀 Bandwidth Hero Cloudflare Worker v3.7 (No Mask Route)
+// ✅ Auto Referer Injection
+// ✅ wsrv.nl + Direct fallback
+// ✅ Cache + KV Stats
+// ✅ Safe for Tachiyomi / Bandwidth Hero apps
 
-// =================== GLOBALS ===================
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
-const pendingRequests = new Map();
-const DEDUP_ENTRY_TTL = 15000;
-const MAX_CONCURRENT_FETCHES = 18;
-let activeFetches = 0;
-const fetchQueue = [];
 
-// We'll trigger dedup cleanup only inside handler now.
-function cleanupDedup() {
-  const now = Date.now();
-  for (const [k, v] of pendingRequests.entries()) {
-    if (now - v.start > DEDUP_ENTRY_TTL) pendingRequests.delete(k);
+// ========================
+// 🔧 Smart Referer Mapping
+// ========================
+function getRefererForHost(hostname) {
+  const host = hostname.toLowerCase();
+
+  // Auto-match numbered Mangabuddy CDNs (s8.mbcdnsah.org / s21.mbcdnsav.org)
+  if (/^s\d+\.mbcdnsah\.org$/.test(host) || /^s\d+\.mbcdnsav\.org$/.test(host)) {
+    return "https://mangabuddy.com/";
   }
+
+  const map = {
+    "cdn.readdetectiveconan.com": "https://mangapiil.com/",
+    "i2.hentaifox.com": "https://hentaifox.com/",
+    "i3.hentaifox.com": "https://hentaifox.com/",
+    "i9.nhentai.net": "https://nhentai.net/",
+  };
+
+  if (map[host]) return map[host];
+  return `https://${hostname}/`;
 }
 
-// =================== HELPERS ===================
-function shortKey(url) {
-  try {
-    const u = new URL(url);
-    return `${u.hostname.replace(/^www\./, '')}${u.pathname.split('/').pop().slice(0, 15)}`;
-  } catch {
-    return url ? url.slice(0, 20) : 'unknown';
-  }
-}
+// ========================
+// ⚙️ Worker Entry Point
+// ========================
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
 
+    if (request.method === "OPTIONS") return handleCORS();
+    if (url.pathname === "/health") return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json" } });
+    if (url.pathname === "/stats") return await showStatsPage(env);
+    if (url.pathname === "/reset") {
+      await env.KV_STATS.delete("stats");
+      return new Response("✅ Stats reset.", { headers: { "Content-Type": "text/plain" } });
+    }
+
+    if (!url.searchParams.get("url")) return getWebInterface();
+
+    try {
+      return await handleImageRequest(request, env, ctx);
+    } catch (err) {
+      console.error("❌ Worker error:", err);
+      return errorResponse(`Internal error: ${err.message}`, 500);
+    }
+  },
+};
+
+// ========================
+// 🔒 Basic Utility Functions
+// ========================
 function handleCORS() {
   return new Response(null, {
     status: 204,
     headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Max-Age': '86400',
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Max-Age": "86400",
     },
   });
 }
 
 function errorResponse(msg, status = 500) {
-  return new Response(JSON.stringify({ error: msg, status }), {
+  return new Response(JSON.stringify({ error: msg, status, timestamp: new Date().toISOString() }), {
     status,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-store',
-    },
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
-}
+}// ========================
+// 🖼️ Image Proxy & Compression
+// ========================
+async function handleImageRequest(request, env, ctx) {
+  const startTime = Date.now();
+  const url = new URL(request.url);
+  const targetUrl = url.searchParams.get("url");
+  const bw = url.searchParams.get("bw") === "1";
+  const jpeg = url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
+  const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
 
-function makeETag(key) {
-  try {
-    const hash = Array.from(key).reduce((h, c) => ((h << 5) - h) + c.charCodeAt(0) | 0, 0);
-    return `"${Math.abs(hash).toString(36)}"`;
-  } catch {
-    return `"etag-${Date.now()}"`;
-  }
-}
-
-function isPrivateHost(host) {
-  if (!host) return true;
-  const lower = host.toLowerCase();
-  return /(localhost|\.local$)/i.test(lower) ||
-    /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(host) ||
-    /^(::1|fc00:|fe80:)/i.test(host);
-}
-// =================== ENTRY POINT ===================
-export default {
-  async fetch(request, env, ctx) {
-    cleanupDedup(); // ✅ cleanup moved here
-    const startTime = Date.now();
-    const url = new URL(request.url);
-
-    if (request.method === 'OPTIONS') return handleCORS();
-    if (url.pathname === '/stats') return await showStatsPage(env);
-    if (url.pathname === '/reset') {
-      await env.KV_STATS.delete('stats');
-      return new Response('✅ Stats reset.', {
-        headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' },
-      });
-    }
-    if (url.pathname === '/health') {
-      return new Response(JSON.stringify({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        activeFetches,
-        pendingRequests: pendingRequests.size,
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
-
-    const target = url.searchParams.get('url');
-    if (!target) return getWebInterface();
-
-    // Validate & normalize URL
-    let parsed;
-    try { parsed = new URL(decodeURIComponent(target)); }
-    catch { return errorResponse('Invalid URL', 400); }
-
-    if (!/^https?:$/.test(parsed.protocol)) return errorResponse('Invalid protocol', 400);
-    if (isPrivateHost(parsed.hostname)) return errorResponse('Private host blocked', 403);
-
-    const etag = makeETag(target);
-    if (request.headers.get('If-None-Match') === etag) {
-      return new Response(null, { status: 304, headers: { 'ETag': etag } });
-    }
-
-    const jpeg = url.searchParams.get('jpg') === '1';
-    const bw = url.searchParams.get('bw') === '1';
-    const q = Math.min(100, Math.max(1, parseInt(url.searchParams.get('l')) || 75));
-
-    try {
-      const res = await handleImageRequest(parsed.href, { jpeg, bw, q, etag, env, ctx, startTime });
-      return res;
-    } catch (err) {
-      console.error('❌ Image error:', err);
-      return errorResponse('Image fetch failed: ' + err.message, 500);
-    }
-  }
-};
-
-// =================== IMAGE HANDLING ===================
-async function handleImageRequest(targetUrl, { jpeg, bw, q, etag, env, ctx, startTime }) {
+  const parsedTarget = new URL(targetUrl);
+  const referer = getRefererForHost(parsedTarget.hostname);
   const cache = caches.default;
-  const cacheKey = new Request(`${targetUrl}?q=${q}&${jpeg ? 'jpg' : 'webp'}${bw ? '&bw' : ''}`);
 
+  const cacheKey = new Request(`${targetUrl}-q${quality}-${jpeg ? "jpg" : "webp"}-${bw ? "bw" : "color"}`);
   const cached = await cache.match(cacheKey);
   if (cached) {
     await updateStats(env, { requests: 1, cacheHits: 1 });
-    return addHeaders(cached, startTime, 'HIT', q, etag);
+    return addHeaders(cached, startTime, "HIT", quality);
   }
 
-  // Race Weserv + Direct
-  const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(targetUrl)}&q=${q}&output=${jpeg ? 'jpg' : 'webp'}${bw ? '&il' : ''}`;
-  const res = await Promise.any([
-    fetchWithTimeout(wsrvUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 8000),
-    fetchWithTimeout(targetUrl, { headers: { 'Referer': parsedOrigin(targetUrl) } }, 10000),
-  ]);
+  console.log(`📥 Fetching ${parsedTarget.hostname} | q=${quality}`);
 
-  if (!res.ok || !(res.headers.get('content-type') || '').startsWith('image/'))
-    throw new Error('Invalid image response');
+  // Try via wsrv.nl
+  const wsrvParams = new URLSearchParams({
+    url: targetUrl,
+    q: quality.toString(),
+    output: jpeg ? "jpg" : "webp",
+  });
+  if (bw) wsrvParams.set("il", "");
+  const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
 
-  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  let response = await fetch(wsrvUrl, {
+    headers: {
+      "Referer": referer,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+      "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+    },
+    cf: { cacheEverything: true, cacheTtl: 604800 },
+  });
+
+  if (!response.ok || !(response.headers.get("content-type") || "").includes("image/")) {
+    console.warn(`⚠️ wsrv.nl failed (${response.status}) — fallback to direct`);
+    response = await fetch(targetUrl, {
+      headers: {
+        "Referer": referer,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+        "Accept": "image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      cf: { cacheEverything: true, cacheTtl: 604800 },
+    });
+  }
+
+  if (!response.ok) {
+    console.error(`❌ Failed (${response.status}) ${targetUrl}`);
+    return errorResponse(`Failed (${response.status})`, response.status);
+  }
+
+  const contentLength = parseInt(response.headers.get("content-length") || "0");
+  const estimatedOriginal = Math.round(contentLength * 1.7);
+  const bytesSaved = estimatedOriginal - contentLength;
+  if (bytesSaved > 0) localStats.bytesSaved += bytesSaved;
+
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
   await updateStats(env, { requests: 1, cacheMisses: 1 });
-  return addHeaders(res, startTime, 'MISS', q, etag);
+
+  return addHeaders(response, startTime, "MISS", quality);
 }
 
-function parsedOrigin(url) {
-  try { return new URL(url).origin + '/'; } catch { return '/'; }
+function addHeaders(response, startTime, cacheStatus, quality) {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "public, max-age=604800");
+  headers.set("X-Cache-Status", cacheStatus);
+  headers.set("X-Quality", quality.toString());
+  headers.set("X-Response-Time", `${Date.now() - startTime}ms`);
+  return new Response(response.body, { status: response.status, headers });
 }
-// =================== FETCH UTILITIES ===================
-async function fetchWithTimeout(url, opts, ms) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    const r = await fetch(url, { ...opts, signal: controller.signal });
-    clearTimeout(t);
-    return r;
-  } catch (e) {
-    clearTimeout(t);
-    throw e;
-  }
-}
-
-function addHeaders(response, startTime, cacheStatus, quality, etag) {
-  const h = new Headers(response.headers);
-  h.set('Access-Control-Allow-Origin', '*');
-  h.set('Cache-Control', 'public, max-age=604800, immutable');
-  h.set('X-Cache-Status', cacheStatus);
-  h.set('X-Response-Time', `${Date.now() - startTime}ms`);
-  h.set('X-Quality', quality);
-  h.set('ETag', etag);
-  return new Response(response.body, { status: response.status, headers: h });
-}
-
-// =================== KV STATS ===================
+// ========================
+// 📊 KV Stats & Interface
+// ========================
 async function updateStats(env, delta) {
-  for (const k in delta) localStats[k] += delta[k] || 0;
+  for (const key in delta) localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
   if (Date.now() - lastFlushTime < 15 * 60 * 1000) return;
+
   try {
-    const kv = (await env.KV_STATS.get('stats', { type: 'json' })) || {
-      requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0,
+    const kvData = (await env.KV_STATS.get("stats", { type: "json" })) || {
+      requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0, lastReset: new Date().toISOString(),
     };
-    for (const k in localStats) kv[k] += localStats[k];
-    await env.KV_STATS.put('stats', JSON.stringify(kv));
+    for (const key in localStats) kvData[key] = (kvData[key] || 0) + localStats[key];
+    await env.KV_STATS.put("stats", JSON.stringify(kvData));
     localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
     lastFlushTime = Date.now();
-  } catch (e) { console.error('KV update failed:', e); }
-}
-
-// =================== UI ===================
-function getWebInterface() {
-  return new Response(
-    `<html><body style="font-family:sans-serif;padding:40px">
-      <h2>⚡ Bandwidth Hero Proxy v3.7</h2>
-      <p>Use: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
-      <p>Stats: <a href="/stats">/stats</a> | Reset: <a href="/reset">/reset</a></p>
-    </body></html>`,
-    { headers: { 'Content-Type': 'text/html' } }
-  );
+  } catch (err) {
+    console.error("❌ KV update failed:", err);
+  }
 }
 
 async function showStatsPage(env) {
-  const s = (await env.KV_STATS.get('stats', { type: 'json' })) || {};
-  const saved = (s.bytesSaved / (1024 * 1024)).toFixed(2);
-  const hitRate = s.requests ? ((s.cacheHits / s.requests) * 100).toFixed(1) : 0;
+  const stats = (await env.KV_STATS.get("stats", { type: "json" })) || { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0, lastReset: "N/A" };
+  const savedMB = (stats.bytesSaved / (1024 * 1024)).toFixed(2);
+  const hitRate = stats.requests > 0 ? ((stats.cacheHits / stats.requests) * 100).toFixed(1) : 0;
   return new Response(
-    `<html><body style="font-family:sans-serif;padding:40px">
-      <h1>📊 Stats</h1>
-      <p>Requests: ${s.requests || 0}</p>
-      <p>Cache Hits: ${s.cacheHits || 0} (${hitRate}%)</p>
-      <p>Misses: ${s.cacheMisses || 0}</p>
-      <p>Saved: ${saved} MB</p>
-    </body></html>`,
-    { headers: { 'Content-Type': 'text/html' } }
+`<!DOCTYPE html><html><head><title>📊 Bandwidth Hero Stats</title></head>
+<body style="font-family:sans-serif;padding:40px;">
+<h1>📊 Bandwidth Hero v3.7</h1>
+<p>Total Requests: ${stats.requests}</p>
+<p>Cache Hits: ${stats.cacheHits} (${hitRate}%)</p>
+<p>Cache Misses: ${stats.cacheMisses}</p>
+<p>Data Saved: ${savedMB} MB</p>
+<p>Last Reset: ${stats.lastReset}</p>
+</body></html>`,
+    { headers: { "Content-Type": "text/html" } }
+  );
+}
+
+function getWebInterface() {
+  return new Response(
+`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
+<h2>⚡ Bandwidth Hero Proxy v3.7</h2>
+<p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
+<ul>
+<li>Auto referer for Mangabuddy, Conan, Hentaifox, NHentai</li>
+<li>Stats: <a href="/stats">/stats</a></li>
+<li>Health: <a href="/health">/health</a></li>
+</ul>
+</body></html>`,
+    { headers: { "Content-Type": "text/html" } }
   );
 }
