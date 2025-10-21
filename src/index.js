@@ -35,7 +35,7 @@ const CDN_TO_SITE_MAP = {
   // Cloudflare CDN patterns
   'images.mangabuddy.com': 'mangabuddy.com',
   'cdn.likemanga.ink': 'likemanga.ink',
-  'img.mangapill.com': 'mangapill.com',
+  'cdn.readdetectiveconan.com': 'mangapill.com',
   'cdn.weebcentral.com': 'weebcentral.com',
   'cdn.manhwaclan.com': 'manhwaclan.com',
   'img.mgeko.cc': 'mgeko.cc',
@@ -413,3 +413,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
 }
+
