@@ -134,7 +134,17 @@ async function handleImageRequest(request, env, ctx) {
     // 🔁 Attempt 3: retry with fallback referer
     if (response.status === 403 || response.status === 404) {
       console.warn(`🔁 Retrying masked via ${MASK_PROXY}`);
-      const maskedUrl = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}`;
+      // 🔁 Retrying masked via ${MASK_PROXY} (preserves compression params)
+const maskedUrl = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}&l=${quality}&jpg=${jpeg ? 1 : 0}&bw=${bw ? 1 : 0}`;
+console.warn(`🔁 Mask retry -> ${maskedUrl}`);
+response = await fetch(maskedUrl, {
+  headers: {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+    "Accept": "image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  },
+  cf: { cacheEverything: true, cacheTtl: 604800 },
+});
 
       response = await fetch(maskedUrl, {
         headers: {
@@ -263,4 +273,5 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
 
