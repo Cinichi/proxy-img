@@ -1,4 +1,4 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v4.3
+// 🚀 Bandwidth Hero Cloudflare Worker v4.4
 // ✅ Auto mask when wsrv.nl fails (18+ safe)
 // ✅ Full referer fix for Mangabuddy, Mangapill, Hentaifox, NHentai
 // ✅ Compression + Cache + KV stats
@@ -28,7 +28,10 @@ function getRefererForHost(hostname, targetUrl = "") {
     return "https://res.mgcdn.xyz/";
 
   // 🔹 Mangapill / Conan
-  if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
+  if (
+    host.includes("readdetectiveconan.com") ||
+    host.includes("mangapill.com")
+  )
     return "https://mangapill.com/";
 
   // 🔹 Hentaifox
@@ -44,6 +47,7 @@ function getRefererForHost(hostname, targetUrl = "") {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
     if (request.method === "OPTIONS") return handleCORS();
     if (url.pathname === "/health")
       return new Response(JSON.stringify({ status: "ok" }), {
@@ -73,10 +77,19 @@ async function handleImageRequest(request, env, ctx) {
   const startTime = Date.now();
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
+
+  // prevent recursion
+  if (url.searchParams.get("mask") === "1") {
+    return fetchDirectImage(targetUrl);
+  }
+
   const bw = url.searchParams.get("bw") === "1";
   const jpeg =
     url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
-  const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
+  const quality = Math.min(
+    100,
+    Math.max(1, parseInt(url.searchParams.get("l")) || 75)
+  );
 
   const parsedTarget = new URL(targetUrl);
   const referer = getRefererForHost(parsedTarget.hostname, targetUrl);
@@ -94,67 +107,59 @@ async function handleImageRequest(request, env, ctx) {
 
   console.log(`📥 Fetching ${parsedTarget.hostname} | q=${quality}`);
 
+  // ✅ Build wsrv URL
   const wsrvParams = new URLSearchParams({
     url: targetUrl,
     q: quality.toString(),
     output: jpeg ? "jpg" : "webp",
   });
   if (bw) wsrvParams.set("il", "");
-  const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
+  let wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
 
   // 🟢 Attempt 1: wsrv.nl
   let response = await fetch(wsrvUrl, {
     headers: {
-      "Referer": referer,
+      Referer: referer,
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-      "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+      Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
     },
     cf: { cacheEverything: true, cacheTtl: 604800 },
   });
 
-  // 🟡 Attempt 2: direct fetch
-  if (!response.ok || !(response.headers.get("content-type") || "").includes("image/")) {
-    console.warn(`⚠️ wsrv.nl failed (${response.status}) — direct or mask retry`);
+  // 🟡 Attempt 2: Direct fetch
+  if (
+    !response.ok ||
+    !(response.headers.get("content-type") || "").includes("image/")
+  ) {
+    console.warn(`⚠️ wsrv.nl failed (${response.status}) — mask retry`);
 
-    let referer1 = getRefererForHost(parsedTarget.hostname, targetUrl);
-    console.log(`🔗 Using referer: ${referer1}`);
+    // ✅ Mask the target for wsrv.nl compression
+    const maskedSource = `${MASK_PROXY}?url=${encodeURIComponent(
+      targetUrl
+    )}&mask=1`;
+    const maskedParams = new URLSearchParams({
+      url: maskedSource,
+      q: quality.toString(),
+      output: jpeg ? "jpg" : "webp",
+    });
+    if (bw) maskedParams.set("il", "");
+    const maskedWsrv = `https://wsrv.nl/?${maskedParams.toString()}`;
+    console.log(`🔁 Masked WSRV -> ${maskedWsrv}`);
 
-    response = await fetch(targetUrl, {
+    response = await fetch(maskedWsrv, {
       headers: {
-        "Referer": referer1,
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-        "Accept": "image/*,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
       },
       cf: { cacheEverything: true, cacheTtl: 604800 },
     });
 
-    // 🔁 Attempt 3: retry with fallback referer
-    if (response.status === 403 || response.status === 404) {
-      console.warn(`🔁 Retrying masked via ${MASK_PROXY}`);
-      // 🔁 Retrying masked via ${MASK_PROXY} (preserves compression params)
-const maskedUrl = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}&l=${quality}&jpg=${jpeg ? 1 : 0}&bw=${bw ? 1 : 0}`;
-console.warn(`🔁 Mask retry -> ${maskedUrl}`);
-response = await fetch(maskedUrl, {
-  headers: {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-    "Accept": "image/*,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-  },
-  cf: { cacheEverything: true, cacheTtl: 604800 },
-});
-
-      response = await fetch(maskedUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-          "Accept": "image/*,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-        cf: { cacheEverything: true, cacheTtl: 604800 },
-      });
+    // 🔁 If even that fails, do final direct fetch
+    if (!response.ok) {
+      console.warn("⚠️ Masked WSRV failed, trying direct fetch fallback.");
+      response = await fetchDirectImage(targetUrl);
     }
   }
 
@@ -172,6 +177,27 @@ response = await fetch(maskedUrl, {
   await updateStats(env, { requests: 1, cacheMisses: 1 });
 
   return addHeaders(response, startTime, "MISS", quality);
+}
+
+// =================== MASK LOGIC ===================
+async function fetchDirectImage(targetUrl) {
+  try {
+    const parsed = new URL(targetUrl);
+    const referer = getRefererForHost(parsed.hostname, targetUrl);
+    const response = await fetch(targetUrl, {
+      headers: {
+        Referer: referer,
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+        Accept: "image/*,*/*;q=0.8",
+      },
+      cf: { cacheEverything: true, cacheTtl: 604800 },
+    });
+    return response;
+  } catch (err) {
+    console.error("❌ Mask fetch error:", err);
+    return errorResponse("Mask fetch failed", 502);
+  }
 }
 
 // =================== HELPERS ===================
@@ -202,14 +228,18 @@ function errorResponse(msg, status = 500) {
     JSON.stringify({ error: msg, status, timestamp: new Date().toISOString() }),
     {
       status,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
     }
   );
 }
 
 // =================== STATS & UI ===================
 async function updateStats(env, delta) {
-  for (const key in delta) localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
+  for (const key in delta)
+    localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
   if (Date.now() - lastFlushTime < 15 * 60 * 1000) return;
 
   try {
@@ -247,7 +277,7 @@ async function showStatsPage(env) {
       : 0;
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h1>📊 Bandwidth Hero v4.3</h1>
+<h1>📊 Bandwidth Hero v4.4</h1>
 <p>Total Requests: ${stats.requests}</p>
 <p>Cache Hits: ${stats.cacheHits} (${hitRate}%)</p>
 <p>Cache Misses: ${stats.cacheMisses}</p>
@@ -261,11 +291,11 @@ async function showStatsPage(env) {
 function getWebInterface() {
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h2>⚡ Bandwidth Hero Proxy v4.3</h2>
+<h2>⚡ Bandwidth Hero Proxy v4.4</h2>
 <p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
 <ul>
 <li>Auto referer for Mangabuddy, Mangapill, Hentaifox, NHentai</li>
-<li>Auto mask 18+ via <code>${MASK_PROXY}</code></li>
+<li>Auto mask + compress 18+ via <code>${MASK_PROXY}</code></li>
 <li>Stats: <a href="/stats">/stats</a></li>
 <li>Health: <a href="/health">/health</a></li>
 </ul>
@@ -273,5 +303,3 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
-
-
