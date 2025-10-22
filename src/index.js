@@ -5,7 +5,7 @@
 // ✅ Works with Tachiyomi & Bandwidth Hero
 
 // =================== CONFIG ===================
-const MASK_PROXY = "https://proxy-img2.mihawk.workers.dev/"; // 👈 your 2nd CF image proxy
+const MASK_PROXY = "https://proxy-img.zoro1.workers.dev/"; // 👈 your 2nd CF image proxy
 
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
@@ -263,3 +263,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
