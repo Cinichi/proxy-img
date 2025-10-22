@@ -1,9 +1,8 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v3.9
-// ✅ Auto Referer Fix for Mangabuddy, Conan, Hentaifox, NHentai
-// ✅ Retry on 403 with alternate Referer (res.mgcdn.xyz)
-// ✅ Works with Tachiyomi / Bandwidth Hero
-// ✅ wsrv.nl + Direct fallback
-// ✅ Cache + KV Stats (15 min flush)
+// 🚀 Bandwidth Hero Cloudflare Worker v4.2
+// ✅ Mangabuddy full referer fix
+// ✅ Auto referer discovery + retry
+// ✅ Compression + KV stats + cache
+// ✅ Works with Tachiyomi & Bandwidth Hero
 
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
@@ -11,21 +10,25 @@ let lastFlushTime = Date.now();
 // ========================
 // 🔧 Smart Referer Mapping
 // ========================
-function getRefererForHost(hostname) {
+function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  // 🔹 All numbered Mangabuddy CDNs
-  if (/^s\d+\.mbcdnsah\.org$/.test(host) || /^s\d+\.mbcdnsav\.org$/.test(host)) {
+  // 🔹 Mangabuddy numbered CDNs (auto-detect)
+  if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
+    const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
+    if (match) {
+      return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
+    }
     return "https://mangabuddy.com/";
   }
 
-  // 🔹 MangaBuddy backup CDN / mgcdn.xyz / mbbcdn
-  if (host.includes("mbbcdn.com") || host.includes("mgcdn.xyz")) {
+  // 🔹 MangaBuddy backup CDN
+  if (host.includes("mgcdn.xyz") || host.includes("mbbcdn.com"))
     return "https://res.mgcdn.xyz/";
-  }
 
-  // 🔹 Detective Conan CDN
-  if (host.includes("readdetectiveconan.com")) return "https://mangapiil.com/";
+  // 🔹 Mangapill / Detective Conan
+  if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
+    return "https://mangapill.com/";
 
   // 🔹 Hentaifox
   if (host.includes("hentaifox.com")) return "https://hentaifox.com/";
@@ -33,7 +36,6 @@ function getRefererForHost(hostname) {
   // 🔹 NHentai
   if (host.includes("nhentai.net")) return "https://nhentai.net/";
 
-  // Default fallback
   return `https://${hostname}/`;
 }
 
@@ -69,7 +71,7 @@ export default {
 };
 
 // ========================
-// 🖼️ Image Handling & Compression
+// 🖼️ Image Handling
 // ========================
 async function handleImageRequest(request, env, ctx) {
   const startTime = Date.now();
@@ -81,12 +83,13 @@ async function handleImageRequest(request, env, ctx) {
   const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
 
   const parsedTarget = new URL(targetUrl);
-  const referer = getRefererForHost(parsedTarget.hostname);
+  const referer = getRefererForHost(parsedTarget.hostname, targetUrl);
   const cache = caches.default;
 
   const cacheKey = new Request(
     `${targetUrl}-q${quality}-${jpeg ? "jpg" : "webp"}-${bw ? "bw" : "color"}`
   );
+
   const cached = await cache.match(cacheKey);
   if (cached) {
     await updateStats(env, { requests: 1, cacheHits: 1 });
@@ -95,7 +98,6 @@ async function handleImageRequest(request, env, ctx) {
 
   console.log(`📥 Fetching ${parsedTarget.hostname} | q=${quality}`);
 
-  // Build wsrv.nl URL
   const wsrvParams = new URLSearchParams({
     url: targetUrl,
     q: quality.toString(),
@@ -104,55 +106,51 @@ async function handleImageRequest(request, env, ctx) {
   if (bw) wsrvParams.set("il", "");
   const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
 
-  // ✅ Attempt 1: wsrv.nl (preferred)
+  // 🟢 Attempt 1: wsrv.nl
   let response = await fetch(wsrvUrl, {
     headers: {
       "Referer": referer,
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
       "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
     },
     cf: { cacheEverything: true, cacheTtl: 604800 },
   });
 
-  // ✅ Attempt 2: Direct fetch fallback
+  // 🟡 Attempt 2: direct fetch (real referer)
   if (!response.ok || !(response.headers.get("content-type") || "").includes("image/")) {
     console.warn(`⚠️ wsrv.nl failed (${response.status}) — direct fetch`);
 
+    let referer1 = getRefererForHost(parsedTarget.hostname, targetUrl);
+    console.log(`🔗 Using referer: ${referer1}`);
+
     response = await fetch(targetUrl, {
       headers: {
-        "Referer": referer,
+        "Referer": referer1,
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
         "Accept": "image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Site": "cross-site",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Dest": "image",
       },
       cf: { cacheEverything: true, cacheTtl: 604800 },
     });
 
-    // ✅ Attempt 3: Retry with alt referer (res.mgcdn.xyz)
-    if (response.status === 403 && parsedTarget.hostname.includes("mbcdns")) {
-      console.warn("🔁 Retrying with backup referer: res.mgcdn.xyz");
+    // 🔁 Attempt 3: retry with fallback referer
+    if (response.status === 403) {
+      console.warn("🔁 Retrying with fallback referer: https://mangabuddy.com/");
       response = await fetch(targetUrl, {
         headers: {
-          "Referer": "https://res.mgcdn.xyz/",
+          "Referer": "https://mangabuddy.com/",
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
           "Accept": "image/*,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
-          "Sec-Fetch-Site": "cross-site",
-          "Sec-Fetch-Mode": "no-cors",
-          "Sec-Fetch-Dest": "image",
         },
         cf: { cacheEverything: true, cacheTtl: 604800 },
       });
     }
   }
 
-  // If all failed
   if (!response.ok) {
     console.error(`❌ Failed (${response.status}) ${targetUrl}`);
     return errorResponse(`Failed (${response.status})`, response.status);
@@ -170,7 +168,7 @@ async function handleImageRequest(request, env, ctx) {
 }
 
 // ========================
-// 🧰 Helpers
+// 🧩 Helpers
 // ========================
 function addHeaders(response, startTime, cacheStatus, quality) {
   const headers = new Headers(response.headers);
@@ -195,27 +193,31 @@ function handleCORS() {
 }
 
 function errorResponse(msg, status = 500) {
-  return new Response(JSON.stringify({ error: msg, status, timestamp: new Date().toISOString() }), {
-    status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-  });
+  return new Response(
+    JSON.stringify({ error: msg, status, timestamp: new Date().toISOString() }),
+    {
+      status,
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    }
+  );
 }
 
 // ========================
-// 📊 KV Stats + Web UI
+// 📊 Stats & Web UI
 // ========================
 async function updateStats(env, delta) {
   for (const key in delta) localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
   if (Date.now() - lastFlushTime < 15 * 60 * 1000) return;
 
   try {
-    const kvData = (await env.KV_STATS.get("stats", { type: "json" })) || {
-      requests: 0,
-      cacheHits: 0,
-      cacheMisses: 0,
-      bytesSaved: 0,
-      lastReset: new Date().toISOString(),
-    };
+    const kvData =
+      (await env.KV_STATS.get("stats", { type: "json" })) || {
+        requests: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
+        bytesSaved: 0,
+        lastReset: new Date().toISOString(),
+      };
     for (const key in localStats)
       kvData[key] = (kvData[key] || 0) + localStats[key];
     await env.KV_STATS.put("stats", JSON.stringify(kvData));
@@ -242,7 +244,7 @@ async function showStatsPage(env) {
       : 0;
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h1>📊 Bandwidth Hero v3.9</h1>
+<h1>📊 Bandwidth Hero v4.2</h1>
 <p>Total Requests: ${stats.requests}</p>
 <p>Cache Hits: ${stats.cacheHits} (${hitRate}%)</p>
 <p>Cache Misses: ${stats.cacheMisses}</p>
@@ -256,10 +258,10 @@ async function showStatsPage(env) {
 function getWebInterface() {
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h2>⚡ Bandwidth Hero Proxy v3.9</h2>
+<h2>⚡ Bandwidth Hero Proxy v4.2</h2>
 <p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
 <ul>
-<li>Auto referer for Mangabuddy, Conan, Hentaifox, NHentai</li>
+<li>Auto referer for Mangabuddy, Mangapill, Hentaifox, NHentai</li>
 <li>Stats: <a href="/stats">/stats</a></li>
 <li>Health: <a href="/health">/health</a></li>
 </ul>
