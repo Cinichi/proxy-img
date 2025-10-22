@@ -1,19 +1,20 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v4.2
-// ✅ Mangabuddy full referer fix
-// ✅ Auto referer discovery + retry
-// ✅ Compression + KV stats + cache
+// 🚀 Bandwidth Hero Cloudflare Worker v4.3
+// ✅ Auto mask when wsrv.nl fails (18+ safe)
+// ✅ Full referer fix for Mangabuddy, Mangapill, Hentaifox, NHentai
+// ✅ Compression + Cache + KV stats
 // ✅ Works with Tachiyomi & Bandwidth Hero
+
+// =================== CONFIG ===================
+const MASK_PROXY = "https://proxy-img2.mihawk.workers.dev/"; // 👈 your 2nd CF image proxy
 
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
 
-// ========================
-// 🔧 Smart Referer Mapping
-// ========================
+// =================== REFERER LOGIC ===================
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  // 🔹 Mangabuddy numbered CDNs (auto-detect)
+  // 🔹 Mangabuddy numbered CDNs
   if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
     const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
     if (match) {
@@ -22,11 +23,11 @@ function getRefererForHost(hostname, targetUrl = "") {
     return "https://mangabuddy.com/";
   }
 
-  // 🔹 MangaBuddy backup CDN
+  // 🔹 Mangabuddy backup CDN
   if (host.includes("mgcdn.xyz") || host.includes("mbbcdn.com"))
     return "https://res.mgcdn.xyz/";
 
-  // 🔹 Mangapill / Detective Conan
+  // 🔹 Mangapill / Conan
   if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
     return "https://mangapill.com/";
 
@@ -39,13 +40,10 @@ function getRefererForHost(hostname, targetUrl = "") {
   return `https://${hostname}/`;
 }
 
-// ========================
-// ⚙️ Worker Entry Point
-// ========================
+// =================== WORKER ENTRY ===================
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") return handleCORS();
     if (url.pathname === "/health")
       return new Response(JSON.stringify({ status: "ok" }), {
@@ -70,9 +68,7 @@ export default {
   },
 };
 
-// ========================
-// 🖼️ Image Handling
-// ========================
+// =================== IMAGE LOGIC ===================
 async function handleImageRequest(request, env, ctx) {
   const startTime = Date.now();
   const url = new URL(request.url);
@@ -111,15 +107,15 @@ async function handleImageRequest(request, env, ctx) {
     headers: {
       "Referer": referer,
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
       "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
     },
     cf: { cacheEverything: true, cacheTtl: 604800 },
   });
 
-  // 🟡 Attempt 2: direct fetch (real referer)
+  // 🟡 Attempt 2: direct fetch
   if (!response.ok || !(response.headers.get("content-type") || "").includes("image/")) {
-    console.warn(`⚠️ wsrv.nl failed (${response.status}) — direct fetch`);
+    console.warn(`⚠️ wsrv.nl failed (${response.status}) — direct or mask retry`);
 
     let referer1 = getRefererForHost(parsedTarget.hostname, targetUrl);
     console.log(`🔗 Using referer: ${referer1}`);
@@ -128,7 +124,7 @@ async function handleImageRequest(request, env, ctx) {
       headers: {
         "Referer": referer1,
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
         "Accept": "image/*,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
@@ -136,13 +132,14 @@ async function handleImageRequest(request, env, ctx) {
     });
 
     // 🔁 Attempt 3: retry with fallback referer
-    if (response.status === 403) {
-      console.warn("🔁 Retrying with fallback referer: https://mangabuddy.com/");
-      response = await fetch(targetUrl, {
+    if (response.status === 403 || response.status === 404) {
+      console.warn(`🔁 Retrying masked via ${MASK_PROXY}`);
+      const maskedUrl = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}`;
+
+      response = await fetch(maskedUrl, {
         headers: {
-          "Referer": "https://mangabuddy.com/",
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
           "Accept": "image/*,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
         },
@@ -167,9 +164,7 @@ async function handleImageRequest(request, env, ctx) {
   return addHeaders(response, startTime, "MISS", quality);
 }
 
-// ========================
-// 🧩 Helpers
-// ========================
+// =================== HELPERS ===================
 function addHeaders(response, startTime, cacheStatus, quality) {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", "*");
@@ -202,9 +197,7 @@ function errorResponse(msg, status = 500) {
   );
 }
 
-// ========================
-// 📊 Stats & Web UI
-// ========================
+// =================== STATS & UI ===================
 async function updateStats(env, delta) {
   for (const key in delta) localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
   if (Date.now() - lastFlushTime < 15 * 60 * 1000) return;
@@ -244,7 +237,7 @@ async function showStatsPage(env) {
       : 0;
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h1>📊 Bandwidth Hero v4.2</h1>
+<h1>📊 Bandwidth Hero v4.3</h1>
 <p>Total Requests: ${stats.requests}</p>
 <p>Cache Hits: ${stats.cacheHits} (${hitRate}%)</p>
 <p>Cache Misses: ${stats.cacheMisses}</p>
@@ -258,10 +251,11 @@ async function showStatsPage(env) {
 function getWebInterface() {
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h2>⚡ Bandwidth Hero Proxy v4.2</h2>
+<h2>⚡ Bandwidth Hero Proxy v4.3</h2>
 <p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
 <ul>
 <li>Auto referer for Mangabuddy, Mangapill, Hentaifox, NHentai</li>
+<li>Auto mask 18+ via <code>${MASK_PROXY}</code></li>
 <li>Stats: <a href="/stats">/stats</a></li>
 <li>Health: <a href="/health">/health</a></li>
 </ul>
