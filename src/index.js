@@ -150,40 +150,46 @@ async function handleImageRequest(request, env, ctx) {
 
   // 🟡 Attempt 2: Masked compression fallback
   if (!response) {
-    if (debug) console.log("🟡 Direct failed — trying masked compression");
+    i// 🟡 Attempt 2: Masked compression fallback (clean mask, no nested params)
+if (!response) {
+  if (debug) console.log("🟡 Direct failed — trying masked compression");
 
-    for (const proxy of proxies) {
-      // Properly encode: inner targetUrl gets encoded, then full mask URL gets encoded for wsrv
-      const maskedSrc = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}`;
-      const maskedUrl = `${proxy.url}?url=${encodeURIComponent(maskedSrc)}&q=${quality}&output=${
-        jpeg ? "jpg" : "webp"
-      }${bw ? "&il" : ""}`;
+  for (const proxy of proxies) {
+    // Inner mask gets ONLY raw image URL
+    const maskedSrc = `${MASK_PROXY}?url=${targetUrl}`;
 
-      if (debug) console.log(`🎭 Masked ${proxy.name} -> ${maskedUrl}`);
+    // Outer proxy handles compression (weserv/wsrv)
+    const maskedUrl = `${proxy.url}?url=${maskedSrc}&q=${quality}&output=${
+      jpeg ? "jpg" : "webp"
+    }${bw ? "&il" : ""}`;
 
-      try {
-        const r = await fetch(maskedUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-            Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
-          },
-          cf: { cacheEverything: true, cacheTtl: 604800 },
-        });
+    console.log(`🎭 Masked ${proxy.name} -> ${maskedUrl}`);
 
-        if (r.ok && (r.headers.get("content-type") || "").includes("image/")) {
-          response = r;
-          usedMethod = `masked-${proxy.name}`;
-          if (debug) console.log(`✅ Masked ${proxy.name} SUCCESS`);
-          break;
-        } else {
-          if (debug) console.log(`❌ Masked ${proxy.name} failed: ${r.status}`);
-        }
-      } catch (err) {
-        if (debug) console.log(`❌ Masked ${proxy.name} error:`, err.message);
+    try {
+      const r = await fetch(maskedUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+          Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+        },
+        cf: { cacheEverything: true, cacheTtl: 604800 },
+      });
+
+      if (r.ok && (r.headers.get("content-type") || "").includes("image/")) {
+        response = r;
+        usedMethod = `masked-${proxy.name}`;
+        if (debug) console.log(`✅ Masked ${proxy.name} SUCCESS`);
+        break;
+      } else {
+        if (debug)
+          console.log(`❌ Masked ${proxy.name} failed: ${r.status}`);
       }
+    } catch (err) {
+      if (debug)
+        console.log(`❌ Masked ${proxy.name} error:`, err.message);
     }
   }
+}
 
   // 🔴 Attempt 3: Direct fetch fallback
   if (!response) {
@@ -360,3 +366,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
