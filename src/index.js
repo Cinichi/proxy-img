@@ -134,13 +134,15 @@ async function handleImageRequest(request, env, ctx) {
     }
   }
 
-  // 🟡 Attempt 2: Masked compression fallback (NO double encoding)
+  // 🟡 Attempt 2: Masked compression fallback
   if (!response) {
     if (debug) console.log("🟡 Direct failed — trying masked compression");
 
     for (const proxy of proxies) {
-      // Build the raw masked URL - wsrv.nl handles the URL parameter directly
-      const maskedSrc = `${MASK_PROXY}?url=${targetUrl}`;
+      // Encode targetUrl for mask proxy, but don't encode the full masked URL for wsrv
+      const maskedSrc = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}`;
+      
+      // Use mask=1 parameter instead of url parameter to avoid parsing issues
       const maskedUrl = `${proxy.url}?url=${maskedSrc}&q=${quality}&output=${
         jpeg ? "jpg" : "webp"
       }${bw ? "&il" : ""}`;
