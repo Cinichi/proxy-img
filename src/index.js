@@ -95,9 +95,14 @@ async function handleImageRequest(request, env, ctx) {
 
   // === ATTEMPT 2: Masked wsrv.nl (double-encoded) ===
   if (!res) {
-    const maskSrc = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}&mask=1`;
-    const doubleEnc = encodeURIComponent(maskSrc);
-    const maskedUrl = `https://wsrv.nl/?url=${doubleEnc}&q=${q}&output=${jpeg ? "jpg" : "webp"}${bw ? "&il" : ""}`;
+    // 🧩 Fixed masked retry (safer encoding, uses images.weserv.nl)
+const maskSrc = `${MASK_PROXY}?mask=1&url=${encodeURIComponent(targetUrl)}`;
+const maskedEncoded = encodeURIComponent(
+  maskSrc.replace(/\?/g, "%3F").replace(/&/g, "%26")
+);
+const maskedUrl = `https://images.weserv.nl/?url=${maskedEncoded}&q=${q}&output=${
+  jpeg ? "jpg" : "webp"
+}${bw ? "&il" : ""}`;
     if (debug) console.log(`🎭 Masked wsrv -> ${maskedUrl}`);
 
     try {
@@ -223,3 +228,4 @@ async function showStatsPage(env) {
 function getWebInterface() {
   return new Response(`<h2>⚡ Bandwidth Hero Proxy v4.7</h2><p>Usage: ?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&debug=1</p><ul><li>Auto wsrv + masked compression</li><li>Referer bypass</li></ul>`, { headers: { "Content-Type": "text/html" } });
 }
+
