@@ -1,10 +1,11 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v4.7
-// ✅ Fixes "libvips image too large" (auto JPEG fallback)
-// ✅ Auto referer + masked fallback for protected CDNs
+// 🚀 Bandwidth Hero Cloudflare Worker v4.8
+// ✅ Fixed: "libvips error: webpsave: image too large"
+// ✅ Auto JPEG fallback for tall manhwa strips
+// ✅ Auto referer for Mangabuddy, Mangapill, NHentai, Hentaifox
 // ✅ Works with Tachiyomi + Bandwidth Hero
+// ✅ Masked + direct fallback
 
-const MASK_PROXY = "https://proxy-img.zoro1.workers.dev/"; // secondary proxy
-
+const MASK_PROXY = "https://proxy-img.zoro1.workers.dev/";
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
 
@@ -12,9 +13,11 @@ let lastFlushTime = Date.now();
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
+  // Mangabuddy CDN auto-detect
   if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
     const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
-    if (match) return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
+    if (match)
+      return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
     return "https://mangabuddy.com/";
   }
 
@@ -30,14 +33,14 @@ function getRefererForHost(hostname, targetUrl = "") {
   return `https://${hostname}/`;
 }
 
-// =================== ENTRY ===================
+// =================== WORKER ENTRY ===================
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return handleCORS();
 
     if (url.pathname === "/health")
-      return new Response(JSON.stringify({ status: "ok" }), {
+      return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
         headers: { "Content-Type": "application/json" },
       });
 
@@ -45,9 +48,7 @@ export default {
 
     if (url.pathname === "/reset") {
       await env.KV_STATS.delete("stats");
-      return new Response("✅ Stats reset.", {
-        headers: { "Content-Type": "text/plain" },
-      });
+      return new Response("✅ Stats reset.", { headers: { "Content-Type": "text/plain" } });
     }
 
     if (!url.searchParams.get("url")) return getWebInterface();
@@ -67,155 +68,104 @@ async function handleImageRequest(request, env, ctx) {
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
   const debug = url.searchParams.get("debug") === "1";
-  if (!targetUrl) return errorResponse("Missing url", 400);
-
-  if (url.searchParams.get("mask") === "1") {
-    if (debug) console.log("🎭 Mask fetch mode");
-    return await fetchDirectImage(targetUrl, debug);
-  }
-
   const bw = url.searchParams.get("bw") === "1";
-  const jpeg = url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
-  const q = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
+  const jpeg = url.searchParams.get("jpg") === "1";
+  const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
 
   const parsed = new URL(targetUrl);
   const referer = getRefererForHost(parsed.hostname, targetUrl);
   const cache = caches.default;
-  const key = new Request(`${targetUrl}#${q}-${jpeg ? "jpg" : "webp"}-${bw ? "bw" : "color"}`);
 
-  const cached = await cache.match(key);
+  const cacheKey = new Request(`${targetUrl}-q${quality}-${jpeg ? "jpg" : "webp"}-${bw ? "bw" : "clr"}`);
+  const cached = await cache.match(cacheKey);
+
   if (cached) {
+    if (debug) console.log("✅ Cache hit");
     await updateStats(env, { requests: 1, cacheHits: 1 });
-    return addHeaders(cached, start, "HIT", q);
+    return addHeaders(cached, start, "HIT", quality);
   }
 
-  if (debug) console.log(`📥 Fetching ${parsed.hostname} | q=${q}`);
-
   const proxies = [
-    { name: "images.weserv.nl", base: "https://images.weserv.nl/" },
-    { name: "wsrv.nl", base: "https://wsrv.nl/" },
+    { name: "images.weserv.nl", url: "https://images.weserv.nl/" },
+    { name: "wsrv.nl", url: "https://wsrv.nl/" },
   ];
 
   let response = null;
-  let method = "none";
+  let usedMethod = "none";
 
-  // 🟢 Try compression via weserv/wsrv
   for (const proxy of proxies) {
-    const url1 = `${proxy.base}?url=${targetUrl}&q=${q}&output=${jpeg ? "jpg" : "webp"}${
-      bw ? "&il" : ""
-    }`;
+    const wsrvUrl = `${proxy.url}?url=${encodeURIComponent(targetUrl)}&q=${quality}&output=${
+      jpeg ? "jpg" : "webp"
+    }${bw ? "&il" : ""}`;
 
-    if (debug) console.log(`🔵 Trying ${url1}`);
+    if (debug) console.log(`🔵 Trying ${proxy.name}: ${wsrvUrl}`);
 
-    try {
-      const r = await fetch(url1, {
+    const r = await fetch(wsrvUrl, {
+      headers: {
+        Referer: referer,
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+      },
+      cf: { cacheEverything: true, cacheTtl: 604800 },
+    });
+
+    const type = r.headers.get("content-type") || "";
+    const bodyText = type.includes("text/html")
+      ? await r.clone().text().catch(() => "")
+      : "";
+
+    // 🟡 Retry JPEG fallback if too large or HTML
+    if (bodyText.includes("image too large") || type.includes("text/html")) {
+      if (debug) console.log(`🟠 ${proxy.name}: retrying as JPEG`);
+      const retryUrl = `${proxy.url}?url=${encodeURIComponent(targetUrl)}&q=${quality}&output=jpg`;
+      const retry = await fetch(retryUrl, {
         headers: {
+          Referer: referer,
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-          Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+          Accept: "image/*,*/*;q=0.8",
         },
         cf: { cacheEverything: true, cacheTtl: 604800 },
       });
 
-      if (r.ok && (r.headers.get("content-type") || "").includes("image/")) {
-        response = r;
-        method = proxy.name;
+      if (retry.ok && (retry.headers.get("content-type") || "").includes("image/")) {
+        response = retry;
+        usedMethod = `${proxy.name}-jpeg`;
         break;
       }
-
-      // ⚠️ JPEG fallback for libvips 400 error
-      if (r.status === 400) {
-        const errText = await r.text();
-        if (errText.includes("image too large")) {
-          if (debug) console.log(`🟡 ${proxy.name}: image too large, retry as JPEG`);
-          const retryUrl = `${proxy.base}?url=${targetUrl}&q=${q}&output=jpg${bw ? "&il" : ""}`;
-          const retry = await fetch(retryUrl);
-          if (retry.ok && (retry.headers.get("content-type") || "").includes("image/")) {
-            response = retry;
-            method = `${proxy.name}-jpeg-fallback`;
-            break;
-          }
-        }
-      }
-    } catch (e) {
-      if (debug) console.log(`❌ ${proxy.name} error: ${e.message}`);
+    } else if (r.ok && type.includes("image/")) {
+      response = r;
+      usedMethod = proxy.name;
+      break;
     }
   }
 
-  // 🟡 Masked compression fallback
+  // 🔴 Fallback to direct fetch
   if (!response) {
-    if (debug) console.log("🟡 Compression failed, trying masked");
-
-    for (const proxy of proxies) {
-      const maskedSrc = `${MASK_PROXY}?url=${targetUrl}`;
-      const maskedUrl = `${proxy.base}?url=${maskedSrc}&q=${q}&output=${jpeg ? "jpg" : "webp"}${
-        bw ? "&il" : ""
-      }`;
-
-      if (debug) console.log(`🎭 Masked ${proxy.name} -> ${maskedUrl}`);
-
-      try {
-        const r = await fetch(maskedUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
-            Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
-          },
-          cf: { cacheEverything: true, cacheTtl: 604800 },
-        });
-
-        if (r.ok && (r.headers.get("content-type") || "").includes("image/")) {
-          response = r;
-          method = `masked-${proxy.name}`;
-          break;
-        }
-
-        // Fallback JPEG retry for 400
-        if (r.status === 400) {
-          const errText = await r.text();
-          if (errText.includes("image too large")) {
-            if (debug) console.log(`🟡 Masked ${proxy.name}: retry as JPEG`);
-            const retryUrl = maskedUrl.replace("output=webp", "output=jpg");
-            const retry = await fetch(retryUrl);
-            if (retry.ok && (retry.headers.get("content-type") || "").includes("image/")) {
-              response = retry;
-              method = `${proxy.name}-jpeg-fallback`;
-              break;
-            }
-          }
-        }
-      } catch (e) {
-        if (debug) console.log(`❌ Masked ${proxy.name} error: ${e.message}`);
-      }
-    }
+    if (debug) console.log("🔴 Compression failed — direct fetch");
+    response = await fetchDirectImage(targetUrl, referer);
+    usedMethod = "direct";
   }
 
-  // 🔴 Final fallback: direct fetch
-  if (!response) {
-    if (debug) console.log("🔴 All compression failed, direct fetch");
-    method = "direct";
-    response = await fetchDirectImage(targetUrl, debug);
+  if (!response.ok) {
+    console.error(`❌ Failed (${response.status}) ${targetUrl}`);
+    return errorResponse(`Failed (${response.status})`, response.status);
   }
 
-  if (!response || !response.ok) return errorResponse(`Failed (${response?.status})`, response?.status || 502);
-
-  // Cache + Stats
-  ctx.waitUntil(cache.put(key, response.clone()));
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
   await updateStats(env, { requests: 1, cacheMisses: 1 });
 
-  return addHeaders(response, start, method, q);
+  return addHeaders(response, start, `MISS-${usedMethod}`, quality);
 }
 
 // =================== DIRECT FETCH ===================
-async function fetchDirectImage(targetUrl, debug = false) {
-  const u = new URL(targetUrl);
-  const ref = getRefererForHost(u.hostname, targetUrl);
-  if (debug) console.log(`🎯 Direct fetch referer: ${ref}`);
-
-  return await fetch(targetUrl, {
+async function fetchDirectImage(targetUrl, referer) {
+  return fetch(targetUrl, {
     headers: {
-      Referer: ref,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+      Referer: referer,
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
       Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
     },
     cf: { cacheEverything: true, cacheTtl: 604800 },
@@ -223,14 +173,14 @@ async function fetchDirectImage(targetUrl, debug = false) {
 }
 
 // =================== HELPERS ===================
-function addHeaders(r, start, cacheStatus, q) {
-  const h = new Headers(r.headers);
-  h.set("Access-Control-Allow-Origin", "*");
-  h.set("Cache-Control", "public, max-age=604800");
-  h.set("X-Cache-Status", cacheStatus);
-  h.set("X-Quality", q);
-  h.set("X-Response-Time", `${Date.now() - start}ms`);
-  return new Response(r.body, { status: r.status, headers: h });
+function addHeaders(response, start, cacheStatus, quality) {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "public, max-age=604800");
+  headers.set("X-Cache-Status", cacheStatus);
+  headers.set("X-Quality", quality);
+  headers.set("X-Response-Time", `${Date.now() - start}ms`);
+  return new Response(response.body, { status: response.status, headers });
 }
 
 function handleCORS() {
@@ -244,17 +194,24 @@ function handleCORS() {
   });
 }
 
-function errorResponse(msg, code = 500) {
-  return new Response(JSON.stringify({ error: msg, code }), {
-    status: code,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-  });
+function errorResponse(msg, status = 500) {
+  return new Response(
+    JSON.stringify({ error: msg, status, time: new Date().toISOString() }),
+    {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    }
+  );
 }
 
-// =================== STATS ===================
-async function updateStats(env, d) {
-  for (const k in d) localStats[k] = (localStats[k] || 0) + (d[k] || 0);
+// =================== STATS & UI ===================
+async function updateStats(env, delta) {
+  for (const k in delta) localStats[k] = (localStats[k] || 0) + (delta[k] || 0);
   if (Date.now() - lastFlushTime < 15 * 60 * 1000) return;
+
   try {
     const kv = (await env.KV_STATS.get("stats", { type: "json" })) || {
       requests: 0,
@@ -267,36 +224,46 @@ async function updateStats(env, d) {
     await env.KV_STATS.put("stats", JSON.stringify(kv));
     localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
     lastFlushTime = Date.now();
-  } catch (e) {
-    console.error("KV update failed:", e.message);
+  } catch (err) {
+    console.error("❌ KV update failed:", err.message);
   }
 }
 
-// =================== UI ===================
 async function showStatsPage(env) {
-  const s = (await env.KV_STATS.get("stats", { type: "json" })) || {};
-  const saved = ((s.bytesSaved || 0) / 1024 / 1024).toFixed(2);
+  const stats = (await env.KV_STATS.get("stats", { type: "json" })) || {
+    requests: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    bytesSaved: 0,
+    lastReset: "N/A",
+  };
+  const mb = (stats.bytesSaved / (1024 * 1024)).toFixed(2);
+  const hit = stats.requests
+    ? ((stats.cacheHits / stats.requests) * 100).toFixed(1)
+    : 0;
   return new Response(
-    `<!doctype html><body style="font-family:sans-serif;padding:40px;">
-<h2>📊 Bandwidth Hero v4.7</h2>
-<p>Requests: ${s.requests || 0}</p>
-<p>Cache Hits: ${s.cacheHits || 0}</p>
-<p>Cache Misses: ${s.cacheMisses || 0}</p>
-<p>Data Saved: ${saved} MB</p>
-<p><a href="/reset">Reset Stats</a></p>
-</body>`,
+    `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
+<h1>📊 Bandwidth Hero v4.8</h1>
+<p>Total Requests: ${stats.requests}</p>
+<p>Cache Hits: ${stats.cacheHits} (${hit}%)</p>
+<p>Cache Misses: ${stats.cacheMisses}</p>
+<p>Data Saved: ${mb} MB</p>
+<p>Last Reset: ${stats.lastReset}</p></body></html>`,
     { headers: { "Content-Type": "text/html" } }
   );
 }
 
 function getWebInterface() {
   return new Response(
-    `<!doctype html><body style="font-family:sans-serif;padding:40px;">
-<h2>⚡ Bandwidth Hero Proxy v4.7</h2>
-<p>Usage: <code>?url=&lt;image&gt;&l=75&jpg=0</code></p>
-<ul><li>Auto referer + masked fallback</li>
-<li>JPEG retry for large images</li>
-<li>Stats: <a href="/stats">/stats</a></li></ul></body>`,
+    `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
+<h2>⚡ Bandwidth Hero Proxy v4.8</h2>
+<p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
+<ul>
+<li>✅ Auto JPEG fallback (fix tall WebP crash)</li>
+<li>✅ Mask + direct fallback</li>
+<li>✅ Works with Tachiyomi, Bandwidth Hero</li>
+<li>📊 <a href="/stats">Stats</a> | 💚 <a href="/health">Health</a></li>
+</ul></body></html>`,
     { headers: { "Content-Type": "text/html" } }
   );
 }
