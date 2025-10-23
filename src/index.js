@@ -1,8 +1,7 @@
-// 🚀 Bandwidth Hero Cloudflare Worker v4.2
-// ✅ Mangabuddy full referer fix
-// ✅ Auto referer discovery + retry
-// ✅ Compression + KV stats + cache
-// ✅ Works with Tachiyomi & Bandwidth Hero
+// 🚀 Bandwidth Hero Cloudflare Worker v5.0
+// ✅ Native compression (cf.image) — works on any CDN
+// ✅ Auto referer detection for Mangabuddy, Mangapill, Hentaifox, NHentai
+// ✅ Cache + KV stats + fallback support
 
 let localStats = { requests: 0, cacheHits: 0, cacheMisses: 0, bytesSaved: 0 };
 let lastFlushTime = Date.now();
@@ -13,16 +12,27 @@ let lastFlushTime = Date.now();
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  // ✅ Mangabuddy all CDN variants (s1.mbcdnsa[a-z].org, res.mgcdn.xyz, res.mbbcdn.com)
-  if (/mbcdnsa[a-z]*\.org$/.test(host) || /mbbcdn\.com$/.test(host) || /mgcdn\.xyz$/.test(host)) {
+  // 🔹 Mangabuddy numbered CDNs (auto-detect)
+  if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host) || host.includes("1stkmgv1.com")) {
+    const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
+    if (match) {
+      return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
+    }
     return "https://mangabuddy.com/";
   }
 
-  if (host.includes("mangapill.com") || host.includes("readdetectiveconan.com")) {
-    return "https://mangapill.com/";
-  }
+  // 🔹 MangaBuddy backup CDN
+  if (host.includes("mgcdn.xyz") || host.includes("mbbcdn.com"))
+    return "https://res.mgcdn.xyz/";
 
+  // 🔹 Mangapill / Conan
+  if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
+    return "https://mangapill.com/";
+
+  // 🔹 Hentaifox
   if (host.includes("hentaifox.com")) return "https://hentaifox.com/";
+
+  // 🔹 NHentai
   if (host.includes("nhentai.net")) return "https://nhentai.net/";
 
   return `https://${hostname}/`;
@@ -34,13 +44,18 @@ function getRefererForHost(hostname, targetUrl = "") {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") return handleCORS();
+
+    // Health
     if (url.pathname === "/health")
       return new Response(JSON.stringify({ status: "ok" }), {
         headers: { "Content-Type": "application/json" },
       });
+
+    // Stats
     if (url.pathname === "/stats") return await showStatsPage(env);
+
+    // Reset
     if (url.pathname === "/reset") {
       await env.KV_STATS.delete("stats");
       return new Response("✅ Stats reset.", {
@@ -48,6 +63,7 @@ export default {
       });
     }
 
+    // UI
     if (!url.searchParams.get("url")) return getWebInterface();
 
     try {
@@ -67,9 +83,9 @@ async function handleImageRequest(request, env, ctx) {
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
   const bw = url.searchParams.get("bw") === "1";
-  const jpeg =
-    url.searchParams.get("jpg") === "1" || url.searchParams.get("jpeg") === "1";
+  const jpeg = url.searchParams.get("jpg") === "1";
   const quality = Math.min(100, Math.max(1, parseInt(url.searchParams.get("l")) || 75));
+  const debug = url.searchParams.get("debug") === "1";
 
   const parsedTarget = new URL(targetUrl);
   const referer = getRefererForHost(parsedTarget.hostname, targetUrl);
@@ -81,79 +97,50 @@ async function handleImageRequest(request, env, ctx) {
 
   const cached = await cache.match(cacheKey);
   if (cached) {
+    if (debug) console.log("✅ Cache hit");
     await updateStats(env, { requests: 1, cacheHits: 1 });
     return addHeaders(cached, startTime, "HIT", quality);
   }
 
-  console.log(`📥 Fetching ${parsedTarget.hostname} | q=${quality}`);
+  if (debug) console.log(`📥 Fetching ${parsedTarget.hostname} | q=${quality}`);
 
-  const wsrvParams = new URLSearchParams({
-    url: targetUrl,
-    q: quality.toString(),
-    output: jpeg ? "jpg" : "webp",
-  });
-  if (bw) wsrvParams.set("il", "");
-  const wsrvUrl = `https://wsrv.nl/?${wsrvParams.toString()}`;
-
-  // 🟢 Attempt 1: wsrv.nl
-  let response = await fetch(wsrvUrl, {
-    headers: {
-      "Referer": referer,
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
-      "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
-    },
-    cf: { cacheEverything: true, cacheTtl: 604800 },
-  });
-
-  // 🟡 Attempt 2: direct fetch (real referer)
-  if (!response.ok || !(response.headers.get("content-type") || "").includes("image/")) {
-    console.warn(`⚠️ wsrv.nl failed (${response.status}) — direct fetch`);
-
-    let referer1 = getRefererForHost(parsedTarget.hostname, targetUrl);
-    console.log(`🔗 Using referer: ${referer1}`);
-
-    response = await fetch(targetUrl, {
+  try {
+    // Native Cloudflare compression
+    const response = await fetch(targetUrl, {
       headers: {
-        "Referer": referer1,
+        "Referer": referer,
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
-        "Accept": "image/*,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
       },
-      cf: { cacheEverything: true, cacheTtl: 604800 },
+      cf: {
+        image: {
+          format: jpeg ? "jpeg" : "webp",
+          quality: quality,
+          grayscale: bw,
+          metadata: "none",
+        },
+        cacheTtl: 604800,
+        cacheEverything: true,
+      },
     });
 
-    // 🔁 Attempt 3: retry with fallback referer
-    if (response.status === 403) {
-      console.warn("🔁 Retrying with fallback referer: https://mangabuddy.com/");
-      response = await fetch(targetUrl, {
-        headers: {
-          "Referer": "https://mangabuddy.com/",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134 Safari/537.36",
-          "Accept": "image/*,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-        cf: { cacheEverything: true, cacheTtl: 604800 },
-      });
-    }
+    if (!response.ok) throw new Error(`Image fetch failed (${response.status})`);
+
+    const contentLength = parseInt(response.headers.get("content-length") || "0");
+    const estimatedOriginal = Math.round(contentLength * 1.6);
+    const bytesSaved = estimatedOriginal - contentLength;
+    if (bytesSaved > 0) localStats.bytesSaved += bytesSaved;
+
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    await updateStats(env, { requests: 1, cacheMisses: 1 });
+
+    if (debug) console.log(`💾 Compressed ${parsedTarget.hostname} | q=${quality}`);
+    return addHeaders(response, startTime, "MISS-CF", quality);
+  } catch (err) {
+    console.error("❌ Direct compression failed:", err);
+    return errorResponse(`Compression failed: ${err.message}`, 500);
   }
-
-  if (!response.ok) {
-    console.error(`❌ Failed (${response.status}) ${targetUrl}`);
-    return errorResponse(`Failed (${response.status})`, response.status);
-  }
-
-  const contentLength = parseInt(response.headers.get("content-length") || "0");
-  const estimatedOriginal = Math.round(contentLength * 1.7);
-  const bytesSaved = estimatedOriginal - contentLength;
-  if (bytesSaved > 0) localStats.bytesSaved += bytesSaved;
-
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  await updateStats(env, { requests: 1, cacheMisses: 1 });
-
-  return addHeaders(response, startTime, "MISS", quality);
 }
 
 // ========================
@@ -186,13 +173,16 @@ function errorResponse(msg, status = 500) {
     JSON.stringify({ error: msg, status, timestamp: new Date().toISOString() }),
     {
       status,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
     }
   );
 }
 
 // ========================
-// 📊 Stats & Web UI
+// 📊 Stats + UI
 // ========================
 async function updateStats(env, delta) {
   for (const key in delta) localStats[key] = (localStats[key] || 0) + (delta[key] || 0);
@@ -228,12 +218,10 @@ async function showStatsPage(env) {
     };
   const savedMB = (stats.bytesSaved / (1024 * 1024)).toFixed(2);
   const hitRate =
-    stats.requests > 0
-      ? ((stats.cacheHits / stats.requests) * 100).toFixed(1)
-      : 0;
+    stats.requests > 0 ? ((stats.cacheHits / stats.requests) * 100).toFixed(1) : 0;
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h1>📊 Bandwidth Hero v4.2</h1>
+<h1>📊 Bandwidth Hero v5.0</h1>
 <p>Total Requests: ${stats.requests}</p>
 <p>Cache Hits: ${stats.cacheHits} (${hitRate}%)</p>
 <p>Cache Misses: ${stats.cacheMisses}</p>
@@ -247,15 +235,16 @@ async function showStatsPage(env) {
 function getWebInterface() {
   return new Response(
     `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;">
-<h2>⚡ Bandwidth Hero Proxy v4.2</h2>
-<p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0</code></p>
+<h2>⚡ Bandwidth Hero Proxy v5.0</h2>
+<p>Usage: <code>?url=&lt;IMAGE_URL&gt;&l=75&jpg=0&bw=0&debug=1</code></p>
 <ul>
-<li>Auto referer for Mangabuddy, Mangapill, Hentaifox, NHentai</li>
-<li>Stats: <a href="/stats">/stats</a></li>
-<li>Health: <a href="/health">/health</a></li>
+<li>✅ Uses Cloudflare's <code>cf.image</code> for compression</li>
+<li>✅ Works on protected CDNs (like Mangabuddy, Mangapill, Hentaifox)</li>
+<li>✅ Auto caching & stats</li>
+<li>✅ Compatible with Tachiyomi</li>
+<li>📊 <a href="/stats">Stats</a> | 🔄 <a href="/reset">Reset</a> | 💚 <a href="/health">Health</a></li>
 </ul>
 </body></html>`,
     { headers: { "Content-Type": "text/html" } }
   );
 }
-
