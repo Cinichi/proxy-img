@@ -13,27 +13,16 @@ let lastFlushTime = Date.now();
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  // 🔹 Mangabuddy numbered CDNs (auto-detect)
-  if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
-    const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
-    if (match) {
-      return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
-    }
+  // ✅ Mangabuddy all CDN variants (s1.mbcdnsa[a-z].org, res.mgcdn.xyz, res.mbbcdn.com)
+  if (/mbcdnsa[a-z]*\.org$/.test(host) || /mbbcdn\.com$/.test(host) || /mgcdn\.xyz$/.test(host)) {
     return "https://mangabuddy.com/";
   }
 
-  // 🔹 MangaBuddy backup CDN
-  if (host.includes("mgcdn.xyz") || host.includes("mbbcdn.com"))
-    return "https://res.mgcdn.xyz/";
-
-  // 🔹 Mangapill / Detective Conan
-  if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
+  if (host.includes("mangapill.com") || host.includes("readdetectiveconan.com")) {
     return "https://mangapill.com/";
+  }
 
-  // 🔹 Hentaifox
   if (host.includes("hentaifox.com")) return "https://hentaifox.com/";
-
-  // 🔹 NHentai
   if (host.includes("nhentai.net")) return "https://nhentai.net/";
 
   return `https://${hostname}/`;
@@ -269,3 +258,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
