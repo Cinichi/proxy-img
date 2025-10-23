@@ -139,11 +139,9 @@ async function handleImageRequest(request, env, ctx) {
     if (debug) console.log("🟡 Direct failed — trying masked compression");
 
     for (const proxy of proxies) {
-      // Encode targetUrl for mask proxy, but don't encode the full masked URL for wsrv
+      // Properly encode: inner targetUrl gets encoded, then full mask URL gets encoded for wsrv
       const maskedSrc = `${MASK_PROXY}?url=${encodeURIComponent(targetUrl)}`;
-      
-      // Use mask=1 parameter instead of url parameter to avoid parsing issues
-      const maskedUrl = `${proxy.url}?url=${maskedSrc}&q=${quality}&output=${
+      const maskedUrl = `${proxy.url}?url=${encodeURIComponent(maskedSrc)}&q=${quality}&output=${
         jpeg ? "jpg" : "webp"
       }${bw ? "&il" : ""}`;
 
