@@ -11,31 +11,42 @@ let lastFlushTime = Date.now();
 // 🔧 Smart Referer Mapping
 // ========================
 function getRefererForHost(hostname, targetUrl = "") {
+function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  // 🔹 Mangabuddy numbered CDNs (auto-detect)
+  // 🔹 Mangabuddy numbered CDNs (auto-detect chapter)
   if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
     const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
-    if (match) {
-      return `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`;
-    }
-    return "https://mangabuddy.com/";
+    return match
+      ? `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`
+      : "https://mangabuddy.com/";
   }
 
-  // 🔹 MangaBuddy backup CDN
-  if (host.includes("mgcdn.xyz") || host.includes("mbbcdn.com"))
-    return "https://res.mgcdn.xyz/";
+  // 🔹 Likemanga + all mirror CDNs
+  if (
+    host.includes("likemanga.ink") ||
+    host.includes("1stkmgv1.com") ||
+    host.includes("1kmgv") ||
+    host.includes("like1.")
+  ) {
+    return "https://likemanga.ink/";
+  }
 
-  // 🔹 Mangapill / Detective Conan
-  if (host.includes("readdetectiveconan.com") || host.includes("mangapill.com"))
-    return "https://mangapill.com/";
+  // 🔹 Backup & other manga mirrors
+  const map = {
+    mgcdn: "https://res.mgcdn.xyz/",
+    mbbcdn: "https://res.mgcdn.xyz/",
+    mangapill: "https://mangapill.com/",
+    readdetectiveconan: "https://mangapill.com/",
+    hentaifox: "https://hentaifox.com/",
+    nhentai: "https://nhentai.net/",
+  };
 
-  // 🔹 Hentaifox
-  if (host.includes("hentaifox.com")) return "https://hentaifox.com/";
+  for (const [key, ref] of Object.entries(map)) {
+    if (host.includes(key)) return ref;
+  }
 
-  // 🔹 NHentai
-  if (host.includes("nhentai.net")) return "https://nhentai.net/";
-
+  // Default fallback — use same host as referer
   return `https://${hostname}/`;
 }
 
@@ -269,3 +280,4 @@ function getWebInterface() {
     { headers: { "Content-Type": "text/html" } }
   );
 }
+
