@@ -70,8 +70,22 @@ export default {
 async function handleImageRequest(request, env, ctx) {
   const startTime = Date.now();
   const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url");
+  let targetUrl = url.searchParams.get("url");
   const debug = url.searchParams.get("debug") === "1";
+
+  // 🔧 Fix for malformed URLs when client sends unencoded nested URLs
+  if (!targetUrl && url.search.includes("url=")) {
+    // Extract URL manually if parsing failed
+    const match = url.search.match(/[?&]url=([^&]+(?:&[^=]+=[^&]+)*)/);
+    if (match) {
+      targetUrl = decodeURIComponent(match[1]);
+      if (debug) console.log("⚠️ Fixed malformed URL:", targetUrl);
+    }
+  }
+
+  if (!targetUrl) {
+    return errorResponse("Missing or invalid URL parameter", 400);
+  }
 
   if (url.searchParams.get("mask") === "1") {
     if (debug) console.log("🎭 MASK MODE fetch");
@@ -180,13 +194,38 @@ async function handleImageRequest(request, env, ctx) {
 
   if (!response || !response.ok) {
     console.error(`❌ Failed (${response?.status}) ${targetUrl}`);
-    return errorResponse(`Failed (${response?.status})`, response?.status || 502);
+    
+    // 🔴 Final fallback: If everything failed, try direct fetch
+    if (response?.status === 403 || response?.status === 502) {
+      if (debug) console.log("🔴 All methods failed, trying direct fetch as last resort");
+      response = await fetchDirectImage(targetUrl, debug);
+      usedMethod = "direct-fallback";
+      
+      if (!response.ok) {
+        return errorResponse(`All methods failed (${response?.status})`, response?.status || 502);
+      }
+    } else {
+      return errorResponse(`Failed (${response?.status})`, response?.status || 502);
+    }
   }
 
   const type = response.headers.get("content-type") || "";
   if (!type.includes("image/")) {
-    console.error("❌ Not an image:", type);
-    return errorResponse("Not an image", 502);
+    // 🔴 If we get HTML instead of image, try direct fetch
+    if (type.includes("text/html") && usedMethod !== "direct" && usedMethod !== "direct-fallback") {
+      if (debug) console.log("⚠️ Got HTML instead of image, trying direct fetch");
+      response = await fetchDirectImage(targetUrl, debug);
+      usedMethod = "direct-fallback";
+      
+      const newType = response.headers.get("content-type") || "";
+      if (!newType.includes("image/")) {
+        console.error("❌ Not an image even after direct fetch:", newType);
+        return errorResponse("Not an image", 502);
+      }
+    } else {
+      console.error("❌ Not an image:", type);
+      return errorResponse("Not an image", 502);
+    }
   }
 
   // Track data saved
