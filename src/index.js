@@ -342,8 +342,9 @@ async function processImage(response, quality, useJpeg, bw, env, targetUrl) {
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
-  if (/^s\d+\.mbcdnsa[a-z]\.org$/.test(host)) {
-    const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
+  if (/^s\d+\.mbcdnsa[a-z]?\.org$/.test(host)) {
+    // Updated regex to handle /res/manga/ path structure
+    const match = targetUrl.match(/\/(?:res\/)?manga\/([^/]+)\/chapter-(\d+)/i);
     return match
       ? `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`
       : "https://mangabuddy.com/";
