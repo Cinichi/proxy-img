@@ -1,5 +1,5 @@
-// Cloudflare Worker - Bandwidth Hero Image Proxy
-// Optimized for edge computing with WebP compression
+// Cloudflare Worker - Bandwidth Hero Proxy (Free Tier)
+// No compression - just referer bypass and stats tracking
 
 export default {
   async fetch(request, env, ctx) {
@@ -89,6 +89,14 @@ async function handleStats(env) {
       margin: 8px 0;
       word-break: break-all;
     }
+    .warning {
+      background: #f59e0b;
+      color: #1a202c;
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 8px;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
@@ -99,7 +107,7 @@ async function handleStats(env) {
         <div>
           <h1>Bandwidth Hero</h1>
           <div class="status-badge">
-            <span>●</span> Cloudflare Edge
+            <span>●</span> Free Tier (No Compression)
           </div>
         </div>
       </div>
@@ -109,47 +117,33 @@ async function handleStats(env) {
         <span class="stat-value">${stats.requests.toLocaleString()}</span>
       </div>
       <div class="stat-row">
-        <span class="stat-label">Data Saved</span>
-        <span class="stat-value">${(stats.bytesSaved / 1024 / 1024).toFixed(2)} MB</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Data Sent</span>
-        <span class="stat-value">${(stats.bytesSent / 1024 / 1024).toFixed(2)} MB</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Saved %</span>
-        <span class="stat-value">${stats.bytesSent > 0 ? ((stats.bytesSaved / (stats.bytesSaved + stats.bytesSent)) * 100).toFixed(1) : 0}%</span>
+        <span class="stat-label">Successful</span>
+        <span class="stat-value">${stats.success}</span>
       </div>
       <div class="stat-row">
         <span class="stat-label">Errors</span>
         <span class="stat-value">${stats.errors}</span>
       </div>
+      <div class="stat-row">
+        <span class="stat-label">403 Retries</span>
+        <span class="stat-value">${stats.retries}</span>
+      </div>
     </div>
 
     <div class="card">
-      <div style="font-size: 18px; margin-bottom: 16px;">📱 Tachiyomi Setup (JPEG)</div>
-      <div class="setup-code">https://YOUR-WORKER.workers.dev/?url=&jpg=1&l=80</div>
-    </div>
-
-    <div class="card">
-      <div style="font-size: 18px; margin-bottom: 16px;">🌐 Web Setup (WebP)</div>
-      <div class="setup-code">https://YOUR-WORKER.workers.dev/?url=&l=85</div>
-    </div>
-
-    <div class="card">
-      <div style="font-size: 18px; margin-bottom: 16px;">⚫ Black & White Mode</div>
-      <div class="setup-code">https://YOUR-WORKER.workers.dev/?url=&bw=1&l=75</div>
+      <div style="font-size: 18px; margin-bottom: 16px;">📱 Tachiyomi Setup</div>
+      <div class="setup-code">https://YOUR-WORKER.workers.dev/?url=</div>
+      <div class="warning">⚠️ Free tier: No compression, only referer bypass</div>
     </div>
 
     <div class="card" style="background: #1a202c;">
       <div style="color: #cbd5e0; font-size: 13px; line-height: 1.6;">
         <strong style="color: #60a5fa;">Features:</strong><br>
-        • WebP & JPEG compression<br>
+        • Referer header bypass<br>
+        • Automatic 403 retry logic<br>
         • Cloudflare global edge network<br>
         • Automatic caching (1 hour)<br>
-        • Black & white conversion<br>
-        • Smart referer handling<br>
-        • Size increase protection
+        • Smart referer handling for manga sites
       </div>
     </div>
   </div>
@@ -172,6 +166,8 @@ function handleHealth() {
   return new Response(JSON.stringify({
     status: 'ok',
     platform: 'cloudflare-workers',
+    tier: 'free',
+    compression: 'disabled',
     timestamp: new Date().toISOString()
   }), {
     headers: { 'Content-Type': 'application/json' }
@@ -189,13 +185,14 @@ async function handleImage(request, env, ctx) {
     return new Response('Missing ?url= parameter', { status: 400 });
   }
 
-  const quality = Math.min(100, Math.max(10, parseInt(url.searchParams.get('l')) || 85));
-  const useJpeg = url.searchParams.get('jpg') === '1' || url.searchParams.get('jpeg') === '1';
-  const bw = url.searchParams.get('bw') === '1';
-
   try {
     const parsedTarget = new URL(targetUrl);
     const referer = getRefererForHost(parsedTarget.hostname, targetUrl);
+
+    // Debug logging
+    console.log('Target URL:', targetUrl);
+    console.log('Hostname:', parsedTarget.hostname);
+    console.log('Generated Referer:', referer);
 
     // Fetch original image
     const response = await fetch(targetUrl, {
@@ -210,130 +207,83 @@ async function handleImage(request, env, ctx) {
       }
     });
 
+    console.log('Response Status:', response.status);
+    console.log('Content-Type:', response.headers.get('content-type'));
+
     if (!response.ok) {
       // Retry with different referer on 403
       if (response.status === 403) {
+        console.log('403 detected, retrying with mangabuddy.com referer');
+        await incrementStat(env, 'retries');
+        
         const retryResponse = await fetch(targetUrl, {
           headers: {
             'Referer': 'https://mangabuddy.com/',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+          },
+          cf: {
+            cacheEverything: true,
+            cacheTtl: 3600
           }
         });
         
+        console.log('Retry Response Status:', retryResponse.status);
+        
         if (!retryResponse.ok) {
-          return new Response(`HTTP ${retryResponse.status}`, { status: retryResponse.status });
+          await incrementStat(env, 'errors');
+          return new Response(`HTTP ${retryResponse.status} - Failed even after retry`, { 
+            status: retryResponse.status 
+          });
         }
         
-        return processImage(retryResponse, quality, useJpeg, bw, env, targetUrl);
+        await incrementStat(env, 'requests');
+        await incrementStat(env, 'success');
+        
+        return proxyImage(retryResponse);
       }
       
+      await incrementStat(env, 'errors');
       return new Response(`HTTP ${response.status}`, { status: response.status });
     }
 
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('image/')) {
+      await incrementStat(env, 'errors');
       return new Response('Not an image', { status: 400 });
     }
 
-    return processImage(response, quality, useJpeg, bw, env, targetUrl);
+    await incrementStat(env, 'requests');
+    await incrementStat(env, 'success');
+
+    return proxyImage(response);
 
   } catch (error) {
+    console.error('Error:', error.message, error.stack);
     await incrementStat(env, 'errors');
     return new Response(`Error: ${error.message}`, { status: 500 });
   }
 }
 
 // ========================
-// 🔄 Image Processing
+// 🔄 Proxy Image (No Compression)
 // ========================
-async function processImage(response, quality, useJpeg, bw, env, targetUrl) {
-  const originalBuffer = await response.arrayBuffer();
-  const originalSize = originalBuffer.byteLength;
+async function proxyImage(response) {
+  const imageBuffer = await response.arrayBuffer();
+  const imageSize = imageBuffer.byteLength;
   
-  await incrementStat(env, 'bytesSent', originalSize);
-  await incrementStat(env, 'requests');
+  console.log('Image Size:', imageSize, 'bytes');
 
-  if (originalSize === 0) {
-    return new Response('Empty image', { status: 400 });
-  }
-
-  // Build compression options
-  const options = {
-    quality,
-    fit: 'inside'
-  };
-
-  // Add format-specific options
-  if (useJpeg) {
-    options.format = 'jpeg';
-  } else {
-    options.format = 'webp';
-  }
-
-  // Add grayscale if requested
-  if (bw) {
-    options.grayscale = true;
-  }
-
-  try {
-    // Use Cloudflare's Image Resizing (if available in your plan)
-    // For free tier, we'll use a simpler approach
-    const compressedResponse = await fetch(targetUrl, {
-      cf: {
-        image: options
-      }
-    });
-
-    const compressedBuffer = await compressedResponse.arrayBuffer();
-    const compressedSize = compressedBuffer.byteLength;
-
-    // Size increase protection - send original if compressed is larger
-    if (compressedSize > originalSize) {
-      console.log(`Size increased: ${compressedSize} > ${originalSize}, sending original`);
-      
-      return new Response(originalBuffer, {
-        headers: {
-          'Content-Type': response.headers.get('content-type'),
-          'Cache-Control': 'public, max-age=31536000, immutable',
-          'X-Compression-Applied': 'no',
-          'X-Original-Size': originalSize.toString(),
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
+  return new Response(imageBuffer, {
+    headers: {
+      'Content-Type': response.headers.get('content-type'),
+      'Content-Length': imageSize.toString(),
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'X-Proxy-Mode': 'passthrough',
+      'X-Image-Size': imageSize.toString(),
+      'Access-Control-Allow-Origin': '*'
     }
-
-    const saved = originalSize - compressedSize;
-    await incrementStat(env, 'bytesSaved', saved);
-
-    const outputFormat = useJpeg ? 'jpeg' : 'webp';
-
-    return new Response(compressedBuffer, {
-      headers: {
-        'Content-Type': `image/${outputFormat}`,
-        'Content-Length': compressedSize.toString(),
-        'Cache-Control': 'public, max-age=31536000, immutable',
-        'X-Original-Size': originalSize.toString(),
-        'X-Compressed-Size': compressedSize.toString(),
-        'X-Bytes-Saved': saved.toString(),
-        'X-Compression-Applied': 'yes',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-
-  } catch (error) {
-    console.error('Compression error:', error);
-    // Fallback to original on error
-    return new Response(originalBuffer, {
-      headers: {
-        'Content-Type': response.headers.get('content-type'),
-        'Cache-Control': 'public, max-age=31536000, immutable',
-        'X-Compression-Applied': 'no',
-        'X-Error': error.message,
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
+  });
 }
 
 // ========================
@@ -342,12 +292,15 @@ async function processImage(response, quality, useJpeg, bw, env, targetUrl) {
 function getRefererForHost(hostname, targetUrl = "") {
   const host = hostname.toLowerCase();
 
+  // MangaBuddy CDN - Updated regex to handle /res/manga/ path
   if (/^s\d+\.mbcdnsa[a-z]?\.org$/.test(host)) {
-    // Updated regex to handle /res/manga/ path structure
     const match = targetUrl.match(/\/(?:res\/)?manga\/([^/]+)\/chapter-(\d+)/i);
-    return match
+    const referer = match
       ? `https://mangabuddy.com/manga/${match[1]}/chapter-${match[2]}`
       : "https://mangabuddy.com/";
+    
+    console.log('MangaBuddy referer generated:', referer);
+    return referer;
   }
 
   if (host.includes("likemanga") || host.includes("1kmgv") || host.includes("like1.") || host.includes("mangayy")) {
@@ -364,10 +317,15 @@ function getRefererForHost(hostname, targetUrl = "") {
   };
 
   for (const [k, v] of Object.entries(map)) {
-    if (host.includes(k)) return v;
+    if (host.includes(k)) {
+      console.log(`Matched referer for ${k}:`, v);
+      return v;
+    }
   }
 
-  return `https://${hostname}/`;
+  const defaultReferer = `https://${hostname}/`;
+  console.log('Using default referer:', defaultReferer);
+  return defaultReferer;
 }
 
 // ========================
@@ -375,11 +333,11 @@ function getRefererForHost(hostname, targetUrl = "") {
 // ========================
 async function getStats(env) {
   if (!env.STATS) {
-    return { requests: 0, bytesSaved: 0, bytesSent: 0, errors: 0 };
+    return { requests: 0, success: 0, errors: 0, retries: 0 };
   }
 
   const stats = await env.STATS.get('stats', 'json');
-  return stats || { requests: 0, bytesSaved: 0, bytesSent: 0, errors: 0 };
+  return stats || { requests: 0, success: 0, errors: 0, retries: 0 };
 }
 
 async function incrementStat(env, key, value = 1) {
