@@ -1,0 +1,22 @@
+services:
+  bwhero:
+    build: .
+    image: bandwidth-hero:latest
+    container_name: bwhero
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - bwhero-data:/root/.pm2   # persists stats + logs across restarts
+    environment:
+      - PORT=4000
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  bwhero-data:
