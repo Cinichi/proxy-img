@@ -180,9 +180,9 @@ function getRefererForHost(hostname, targetUrl = "") {
       : "https://mangabuddy.com/";
   }
 
-  if (host.includes("likemanga") || host.includes("1kmgv") || host.includes("like1.") || host.includes("mangayy")) {
-    return "https://likemanga.ink/";
-  }
+  if (host.includes("likemanga") || host.includes("1kmgv") || host.includes("like1.") || host.includes("mangayy") || host.includes("mgread")) {
+  return "https://likemanga.ink/";
+}
 
   const map = {
     mgcdn: "https://res.mgcdn.xyz/",
