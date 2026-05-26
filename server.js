@@ -191,6 +191,7 @@ function getRefererForHost(hostname, targetUrl = "") {
     readdetectiveconan: "https://mangapill.com/",
     hentaifox: "https://hentaifox.com/",
     nhentai: "https://nhentai.net/",
+    hentaicdn: "https://hentalk.pw/",
   };
 
   for (const [k, v] of Object.entries(map)) {
