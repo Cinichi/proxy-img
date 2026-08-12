@@ -180,7 +180,11 @@ function getRefererForHost(hostname, targetUrl = "") {
       : "https://mangabuddy.com/";
   }
 
-  if (host.includes("likemanga") || host.includes("1kmgv") || host.includes("like1.") || host.includes("mangayy") || host.includes("mgread")) {
+  if (host.includes("qvzrh")) {
+  return "https://mangak.io/";
+}
+
+if (host.includes("likemanga") || host.includes("1kmgv") || host.includes("like1.") || host.includes("mangayy") || host.includes("mgread")) {
   return "https://likemanga.ink/";
 }
 
