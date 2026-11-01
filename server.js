@@ -790,6 +790,7 @@ app.get('/dashboard', (req, res) => {
     <button class="nav-btn active" onclick="showPage('stats',this)">📊 Stats</button>
     <button class="nav-btn" onclick="showPage('logs',this)">📋 Logs</button>
     <button class="nav-btn" onclick="showPage('health',this)">❤️ Health</button>
+    <button class="nav-btn" onclick="location.href='/refcheck'">🧪 Referer</button>
   </nav>
 </div>
 
@@ -1236,6 +1237,473 @@ app.get('/logs/stream', (req, res) => {
 // ========================
 // 🏁 Start / shutdown
 // ========================
+// >>> refcheck (Referer Lab: error log by time window, referer tester, live rules)
+;(function refcheck() {
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const dns = require('dns'), net = require('net'), http = require('http'), https = require('https');
+  const express = require('express');
+
+  const DATA_DIR = process.env.REFCHECK_DIR || path.join(os.homedir(), '.pm2');
+  const ERR_FILE = path.join(DATA_DIR, 'bwhero-errors.json');
+  const RULES_FILE = path.join(DATA_DIR, 'bwhero-referers.json');
+  const TOKEN = process.env.REFCHECK_TOKEN || '';
+  const ALLOW_PRIVATE = process.env.ALLOW_PRIVATE === '1';
+  const MAX_URLS = 3000, MAX_HITS = 50, MAX_RECHECK = 40, MAX_REFERERS = 16;
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+  const KNOWN = ['https://mangak.io/', 'https://likemanga.ink/', 'https://mangabuddy.com/', 'https://res.mgcdn.xyz/',
+    'https://mangapill.com/', 'https://hentaifox.com/', 'https://nhentai.net/', 'https://hentalk.pw/'];
+
+  // ---------- storage ----------
+  function readJson(f, def) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return def; } }
+  function writeJson(f, data) {
+    try {
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f + '.tmp', JSON.stringify(data));
+      fs.renameSync(f + '.tmp', f);
+    } catch (e) {}
+  }
+  const errors = new Map(Object.entries(readJson(ERR_FILE, {})));
+  let rules = readJson(RULES_FILE, []);
+  if (!Array.isArray(rules)) rules = [];
+  let dirty = false;
+  const saveErrors = () => { dirty = false; writeJson(ERR_FILE, Object.fromEntries(errors)); };
+  setInterval(() => {
+    const old = Date.now() - 7 * 86400000;
+    for (const [k, v] of errors) if (v.last < old) { errors.delete(k); dirty = true; }
+    if (dirty) saveErrors();
+  }, 60000).unref();
+  process.on('exit', () => { if (dirty) saveErrors(); });
+
+  // ---------- error collector (listens to addLog) ----------
+  const ERR_RE = /^\u274C\s+(.+?)\s+\|\s+(https?:\/\/\S+)\s*$/;
+  const OK_RE = /^\S+\s+(COMPRESSED|ORIGINAL|SKIP|CACHE HIT)\b.*\|\s+(https?:\/\/\S+)\s*$/;
+
+  function record(url, kind) {
+    let e = errors.get(url);
+    if (!e) {
+      if (errors.size >= MAX_URLS) {
+        let oldest = null, ot = Infinity;
+        for (const [k, v] of errors) if (v.last < ot) { ot = v.last; oldest = k; }
+        errors.delete(oldest);
+      }
+      let host = '';
+      try { host = new URL(url).hostname; } catch (_) {}
+      e = { url, host, kind, first: Date.now(), last: 0, hits: [], ok: 0 };
+      errors.set(url, e);
+    }
+    const now = Date.now();
+    e.kind = kind; e.last = now; e.hits.push(now);
+    if (e.hits.length > MAX_HITS) e.hits.shift();
+    dirty = true;
+  }
+
+  function onLog(msg) {
+    let m = ERR_RE.exec(msg);
+    if (m) return record(m[2], m[1]);
+    m = OK_RE.exec(msg);
+    if (m) { const e = errors.get(m[2]); if (e) { e.ok = Date.now(); dirty = true; } }
+  }
+
+  try {
+    const origAddLog = addLog;
+    addLog = function (msg) { try { onLog(String(msg)); } catch (_) {} return origAddLog.apply(this, arguments); };
+  } catch (e) { console.error('refcheck: could not hook addLog:', e.message); }
+
+  // ---------- live rules (override getRefererForHost, no restart needed) ----------
+  try {
+    const origRef = getRefererForHost;
+    getRefererForHost = function (hostname) {
+      const h = String(hostname || '').toLowerCase();
+      for (const r of rules) if (h.includes(r.match)) return r.referer;
+      return origRef.apply(this, arguments);
+    };
+  } catch (e) { console.error('refcheck: could not hook getRefererForHost:', e.message); }
+
+  // ---------- safe probing (SSRF guarded) ----------
+  function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) {
+      const [a, b] = ip.split('.').map(Number);
+      return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+    }
+    if (net.isIPv6(ip)) {
+      const l = ip.toLowerCase();
+      if (l === '::1' || l === '::') return true;
+      if (l.startsWith('::ffff:')) { const v4 = l.slice(7); return net.isIPv4(v4) ? isPrivateIp(v4) : true; }
+      return /^f[cd]/.test(l) || /^fe[89ab]/.test(l);
+    }
+    return true;
+  }
+
+  function guardedLookup(hostname, options, cb) {
+    if (typeof options === 'function') { cb = options; options = {}; }
+    dns.lookup(hostname, options || {}, (err, ...args) => {
+      if (err) return cb(err);
+      if (!ALLOW_PRIVATE) {
+        const list = options && options.all ? args[0] : [{ address: args[0] }];
+        if (list.some(a => isPrivateIp(a.address))) {
+          const e = new Error('Blocked private address'); e.code = 'EBLOCKED'; return cb(e);
+        }
+      }
+      cb(null, ...args);
+    });
+  }
+
+  function assertAllowed(u) {
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Only http(s) URLs are allowed');
+    const h = u.hostname.replace(/^\[|\]$/g, '');
+    if (!ALLOW_PRIVATE && net.isIP(h) && isPrivateIp(h)) throw new Error('Blocked private address');
+  }
+
+  // headers only, body is dropped immediately (no bandwidth wasted)
+  function probeOnce(u, referer) {
+    return new Promise((resolve, reject) => {
+      const headers = { 'User-Agent': UA, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
+      if (referer) headers.Referer = referer;
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.request(u, { method: 'GET', headers, lookup: guardedLookup, agent: false, timeout: 10000 }, res => {
+        res.destroy();
+        resolve({ status: res.statusCode, headers: res.headers });
+      });
+      req.on('timeout', () => { const e = new Error('timeout'); e.code = 'ETIMEDOUT'; req.destroy(e); });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  async function probe(urlStr, referer) {
+    const t0 = Date.now();
+    try {
+      let u = new URL(urlStr);
+      for (let i = 0; i <= 5; i++) {
+        assertAllowed(u);
+        const r = await probeOnce(u, referer);
+        if ([301, 302, 303, 307, 308].includes(r.status) && r.headers.location) { u = new URL(r.headers.location, u); continue; }
+        const type = String(r.headers['content-type'] || '');
+        return {
+          status: r.status, type: type.split(';')[0], ms: Date.now() - t0,
+          len: r.headers['content-length'] ? Number(r.headers['content-length']) : null,
+          ok: r.status === 200 && /^image\//i.test(type)
+        };
+      }
+      return { status: 0, error: 'too many redirects', ok: false, ms: Date.now() - t0 };
+    } catch (e) {
+      return { status: 0, error: e.code || e.message, ok: false, ms: Date.now() - t0 };
+    }
+  }
+
+  async function pool(items, n, fn) {
+    const out = new Array(items.length);
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+      while (i < items.length) { const k = i++; out[k] = await fn(items[k]); }
+    }));
+    return out;
+  }
+
+  function candidates(urlStr, extra) {
+    const u = new URL(urlStr), host = u.hostname.toLowerCase(), list = [];
+    const add = (label, ref) => { if (!list.some(x => x.referer === ref)) list.push({ label, referer: ref }); };
+    add('current rule', getRefererForHost(u.hostname, urlStr));
+    (extra || []).forEach(r => add('custom', r));
+    add('no referer', '');
+    add('same host', 'https://' + host + '/');
+    const parts = host.split('.');
+    if (parts.length > 2) add('parent domain', 'https://' + parts.slice(-2).join('.') + '/');
+    rules.forEach(r => add('live rule', r.referer));
+    KNOWN.forEach(r => add('known site', r));
+    return list.slice(0, MAX_REFERERS);
+  }
+
+  // qvzra + qvzrb + qvzrc -> "qvzr"
+  function suggest(host, hosts) {
+    if (net.isIP(host)) return host;
+    const sld = h => { const p = h.split('.'); return p.length >= 2 ? p[p.length - 2] : h; };
+    const tld = h => h.split('.').pop();
+    let p = sld(host);
+    hosts.filter(h => tld(h) === tld(host) && sld(h) !== sld(host)).forEach(h => {
+      const s = sld(h); let i = 0;
+      while (i < p.length && i < s.length && p[i] === s[i]) i++;
+      if (i >= 4) p = p.slice(0, i);
+    });
+    return p;
+  }
+
+  function cutoffFor(s) {
+    s = String(s || '1h');
+    if (s === 'all') return 0;
+    const m = /^(\d+)([mhd])$/.exec(s);
+    if (!m) return Date.now() - 3600000;
+    return Date.now() - Number(m[1]) * { m: 60000, h: 3600000, d: 86400000 }[m[2]];
+  }
+
+  // ---------- routes ----------
+  let busy = 0;
+  const json = () => express.json({ limit: '50kb' });
+  function auth(req, res, next) {
+    if (!TOKEN) return next();
+    const g = String(req.query.token || (req.get && req.get('x-token')) || '');
+    if (g === TOKEN) return next();
+    res.status(401).json({ error: 'token required: open /refcheck?token=YOUR_TOKEN' });
+  }
+
+  app.get('/refcheck', auth, (req, res) => res.type('html').send(PAGE));
+
+  app.get('/refcheck/api/errors', auth, (req, res) => {
+    const cutoff = cutoffFor(req.query.since);
+    const items = [], hostMap = new Map();
+    let recovered = 0;
+    for (const e of errors.values()) {
+      if (e.last < cutoff) continue;
+      const fixed = e.ok > e.last;
+      const hits = e.hits.filter(t => t >= cutoff).length;
+      items.push({ url: e.url, host: e.host, kind: e.kind, last: e.last, hits, fixed });
+      if (fixed) { recovered++; continue; }
+      const h = hostMap.get(e.host) || { host: e.host, urls: 0, hits: 0, kinds: {} };
+      h.urls++; h.hits += hits; h.kinds[e.kind] = (h.kinds[e.kind] || 0) + 1;
+      hostMap.set(e.host, h);
+    }
+    items.sort((a, b) => (a.fixed - b.fixed) || (b.last - a.last));
+    res.json({
+      since: String(req.query.since || '1h'), now: Date.now(),
+      failing: items.length - recovered, recovered,
+      hosts: [...hostMap.values()].sort((a, b) => b.hits - a.hits).slice(0, 30),
+      items: items.slice(0, 200)
+    });
+  });
+
+  app.post('/refcheck/api/errors/clear', auth, (req, res) => { errors.clear(); saveErrors(); res.json({ ok: true }); });
+
+  app.post('/refcheck/api/test', auth, json(), async (req, res) => {
+    if (busy >= 3) return res.status(429).json({ error: 'Busy, try again in a few seconds' });
+    const b = req.body || {};
+    const urlStr = String(b.url || '').trim();
+    let u;
+    try { u = new URL(urlStr); assertAllowed(u); } catch (e) { return res.status(400).json({ error: e.message }); }
+    const extra = String(b.extra || '').split(/[\s,]+/).filter(s => /^https?:\/\//i.test(s)).slice(0, 4);
+    busy++;
+    try {
+      const results = await pool(candidates(urlStr, extra), 5, async c => Object.assign({ label: c.label, referer: c.referer }, await probe(urlStr, c.referer)));
+      results.sort((a, b2) => (b2.ok - a.ok) || (a.ms - b2.ms));
+      const hosts = [...new Set([...errors.values()].filter(e => !(e.ok > e.last)).map(e => e.host))];
+      res.json({ url: urlStr, host: u.hostname, suggest: suggest(u.hostname, hosts), results });
+    } finally { busy--; }
+  });
+
+  app.post('/refcheck/api/recheck', auth, json(), async (req, res) => {
+    if (busy >= 3) return res.status(429).json({ error: 'Busy, try again in a few seconds' });
+    const b = req.body || {};
+    const ref = String(b.referer || '').trim();
+    if (ref && !/^https?:\/\//i.test(ref)) return res.status(400).json({ error: 'Referer must start with http(s)://' });
+    const cutoff = cutoffFor(b.since);
+    const all = [...errors.values()].filter(e => e.last >= cutoff && !(e.ok > e.last)).sort((a, b2) => b2.last - a.last);
+    busy++;
+    try {
+      const out = await pool(all.slice(0, MAX_RECHECK), 6, async e => {
+        const r = ref || getRefererForHost(e.host, e.url);
+        const p = await probe(e.url, r);
+        if (p.ok && !ref) { e.ok = Date.now(); dirty = true; }
+        return { url: e.url, host: e.host, referer: r, status: p.status, type: p.type, error: p.error, ok: p.ok, ms: p.ms };
+      });
+      res.json({ checked: out.length, truncated: all.length > MAX_RECHECK, referer: ref || 'current rules', good: out.filter(o => o.ok), bad: out.filter(o => !o.ok) });
+    } finally { busy--; }
+  });
+
+  app.get('/refcheck/api/rules', auth, (req, res) => res.json({ rules }));
+
+  app.post('/refcheck/api/rules', auth, json(), (req, res) => {
+    const b = req.body || {};
+    const match = String(b.match || '').trim().toLowerCase();
+    const referer = String(b.referer || '').trim();
+    if (!/^[a-z0-9.-]{2,60}$/.test(match)) return res.status(400).json({ error: 'Rule key: 2-60 chars, a-z 0-9 . -' });
+    if (!/^https?:\/\/\S{3,200}$/i.test(referer)) return res.status(400).json({ error: 'Referer must be a full http(s) URL' });
+    rules = rules.filter(r => r.match !== match);
+    rules.unshift({ id: Date.now().toString(36), match, referer, added: Date.now() });
+    if (rules.length > 100) rules.length = 100;
+    writeJson(RULES_FILE, rules);
+    addLog('\uD83E\uDDEA RULE | ' + match + ' -> ' + referer);
+    res.json({ ok: true, rules });
+  });
+
+  app.delete('/refcheck/api/rules/:id', auth, (req, res) => {
+    rules = rules.filter(r => r.id !== req.params.id);
+    writeJson(RULES_FILE, rules);
+    res.json({ ok: true, rules });
+  });
+
+  // ---------- page ----------
+  const PAGE = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Referer Lab</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;--accent:#6366f1;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--text:#e2e8f0;--muted:#64748b;--mono:ui-monospace,Menlo,Consolas,monospace}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+.top{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:5}
+.top a{color:var(--muted);text-decoration:none;font-size:13px}
+.wrap{max-width:760px;margin:0 auto;padding:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.chip,.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 12px;border-radius:20px;font-size:12px;cursor:pointer;font-family:inherit}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn{border-radius:8px}.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}.btn.ok{background:#14532d;border-color:#166534;color:#4ade80}
+.btn:disabled{opacity:.5}
+input,textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:9px 10px;border-radius:8px;font-size:13px;font-family:var(--mono);margin:6px 0}
+textarea{height:110px;resize:vertical;font-size:11px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px}
+.row>div{min-width:0}.row:last-child{border-bottom:none}
+.mono{font-family:var(--mono);word-break:break-all}
+.muted{color:var(--muted)}.good{color:var(--green)}.bad{color:var(--red)}
+.badge{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:10px;background:var(--bg)}
+.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+</style></head><body>
+<div class="top"><a href="/dashboard">&larr; Dashboard</a><b>Referer Lab</b><span></span></div>
+<div class="wrap">
+
+<div class="card"><h3>Failing URLs</h3>
+ <div class="chips" id="chips">
+  <button class="chip" data-act="since" data-s="15m">15m</button><button class="chip" data-act="since" data-s="30m">30m</button>
+  <button class="chip" data-act="since" data-s="1h">1h</button><button class="chip" data-act="since" data-s="6h">6h</button>
+  <button class="chip" data-act="since" data-s="24h">24h</button><button class="chip" data-act="since" data-s="7d">7d</button>
+  <button class="chip" data-act="since" data-s="all">all</button>
+ </div>
+ <div id="err-box" class="muted">Loading...</div>
+ <input id="re-ref" placeholder="Referer for re-check (blank = current rules)">
+ <div class="acts">
+  <button class="btn pri" id="btn-recheck" data-act="recheck">Re-check all</button>
+  <button class="btn" data-act="copyfailing">Copy failing URLs</button>
+  <button class="btn" data-act="clear">Clear list</button>
+ </div>
+ <div id="re-out"></div>
+</div>
+
+<div class="card"><h3>Test one URL against many referers</h3>
+ <input id="t-url" placeholder="https://rx.qvzra.org/r/p/xxx/yyy.webp">
+ <input id="t-extra" placeholder="Extra referer(s) to try (optional)">
+ <div class="acts"><button class="btn pri" id="btn-test" data-act="runtest">Test</button></div>
+ <div id="t-out"></div>
+</div>
+
+<div class="card"><h3>Live referer rules (active instantly, no restart)</h3>
+ <div id="rules"></div><div id="rule-msg" class="muted" style="margin-top:8px"></div>
+</div>
+</div>
+<script>
+var $=function(i){return document.getElementById(i)};
+var NL=String.fromCharCode(10);
+var TOKEN=new URLSearchParams(location.search).get('token')||'';
+var since='1h',lastErrors=null;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function api(path,body,method){
+  var u='/refcheck/api/'+path;if(TOKEN)u+=(u.indexOf('?')<0?'?':'&')+'token='+encodeURIComponent(TOKEN);
+  var o={method:method||(body?'POST':'GET'),headers:{}};
+  if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body)}
+  return fetch(u,o).then(function(r){return r.json()});
+}
+function ago(ts){var s=Math.round((Date.now()-ts)/1000);if(s<60)return s+'s';if(s<3600)return Math.round(s/60)+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'}
+function kb(n){return n>=1048576?(n/1048576).toFixed(1)+'MB':Math.round(n/1024)+'KB'}
+function copyText(t,btn){
+  function done(){if(btn){var o=btn.textContent;btn.textContent='Copied';setTimeout(function(){btn.textContent=o},1200)}}
+  function fb(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{document.execCommand('copy');done()}catch(e){prompt('Copy:',t)}document.body.removeChild(a)}
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(done,fb);else fb();
+}
+function setSince(s){since=s;[].forEach.call(document.querySelectorAll('.chip'),function(c){c.classList.toggle('on',c.dataset.s===s)});loadErrors()}
+function loadErrors(){
+  api('errors?since='+since).then(function(d){
+    lastErrors=d;
+    var h='<div class="muted" style="margin-bottom:8px">'+d.failing+' failing &middot; '+d.recovered+' recovered (last '+esc(since)+')</div>';
+    d.hosts.forEach(function(x){
+      var k=Object.keys(x.kinds).map(function(n){return n+' x'+x.kinds[n]}).join(', ');
+      h+='<div class="row"><span class="mono">'+esc(x.host)+'</span><span class="muted">'+x.urls+' url &middot; '+x.hits+' hits &middot; '+esc(k)+'</span></div>';
+    });
+    h+='<div style="margin-top:10px">';
+    d.items.slice(0,60).forEach(function(it){
+      h+='<div class="row"><div><span class="badge '+(it.fixed?'good':'bad')+'">'+(it.fixed?'ok now':esc(it.kind))+'</span> <span class="muted">'+ago(it.last)+' ago &middot; x'+it.hits+'</span><div class="mono">'+esc(it.url)+'</div></div><button class="btn" data-act="test" data-url="'+esc(it.url)+'">Test</button></div>';
+    });
+    if(!d.items.length)h+='<div class="muted">No errors in this window.</div>';
+    $('err-box').innerHTML=h+'</div>';
+  });
+}
+function recheck(){
+  var b=$('btn-recheck');b.disabled=true;b.textContent='Checking...';
+  api('recheck',{since:since,referer:$('re-ref').value.trim()}).then(function(d){
+    b.disabled=false;b.textContent='Re-check all';
+    if(d.error){$('re-out').innerHTML='<div class="bad" style="margin-top:8px">'+esc(d.error)+'</div>';return}
+    var h='<div class="muted" style="margin:10px 0 6px">Checked '+d.checked+(d.truncated?' (newest only)':'')+' with '+esc(d.referer)+'</div>';
+    if(d.good.length){
+      var urls=d.good.map(function(x){return x.url}).join(NL);
+      h+='<div class="good">'+d.good.length+' good - copy these</div><textarea readonly id="good-list">'+esc(urls)+'</textarea><div class="acts"><button class="btn ok" data-act="copyid" data-id="good-list">Copy '+d.good.length+' links</button></div>';
+    }
+    if(d.bad.length){
+      h+='<div class="bad" style="margin-top:10px">'+d.bad.length+' still failing</div>';
+      d.bad.forEach(function(x){h+='<div class="row"><div class="mono">'+esc(x.url)+'<div class="muted">'+(x.status||esc(x.error||'err'))+' '+esc(x.type||'')+'</div></div><button class="btn" data-act="test" data-url="'+esc(x.url)+'">Test</button></div>'});
+    }
+    if(!d.good.length&&!d.bad.length)h+='<div class="muted">Nothing to check in this window.</div>';
+    $('re-out').innerHTML=h;loadErrors();
+  });
+}
+function runTest(){
+  var b=$('btn-test');b.disabled=true;b.textContent='Testing...';
+  api('test',{url:$('t-url').value.trim(),extra:$('t-extra').value.trim()}).then(function(d){b.disabled=false;b.textContent='Test';renderTest(d)});
+}
+function renderTest(d){
+  if(d.error){$('t-out').innerHTML='<div class="bad" style="margin-top:8px">'+esc(d.error)+'</div>';return}
+  var best=d.results.filter(function(r){return r.ok})[0];
+  var h='<div class="muted" style="margin:6px 0">'+esc(d.host)+'</div>';
+  if(best){
+    var curl='curl -L'+(best.referer?' -e "'+best.referer+'"':'')+' "'+d.url+'" -o /dev/null -w "%{http_code} %{content_type}"';
+    h+='<div class="good" style="margin:6px 0">Working link + referer</div><textarea readonly>'+esc(d.url+NL+'referer: '+(best.referer||'(none)')+NL+curl)+'</textarea>';
+    h+='<div class="acts"><button class="btn ok" data-act="copy" data-text="'+esc(d.url)+'">Copy link</button><button class="btn" data-act="copy" data-text="'+esc(curl)+'">Copy curl</button></div>';
+    h+='<div class="muted" style="margin-top:10px">Rule key (host contains):</div><input id="rule-key" value="'+esc(d.suggest)+'">';
+  }else h+='<div class="bad" style="margin:6px 0">No referer worked - link may be expired or needs cookies/other headers</div>';
+  d.results.forEach(function(r){
+    h+='<div class="row"><div><span class="badge '+(r.ok?'good':'bad')+'">'+(r.ok?'OK ':'X ')+(r.status||esc(r.error||'err'))+'</span> <span class="muted">'+esc(r.type||'')+' '+(r.len!=null?kb(r.len)+' ':'')+r.ms+'ms</span><div class="mono">'+esc(r.label)+': '+esc(r.referer||'(none)')+'</div></div>';
+    if(r.ok&&r.referer)h+='<div class="acts"><button class="btn" data-act="copy" data-text="'+esc(r.referer)+'">Copy</button><button class="btn pri" data-act="apply" data-ref="'+esc(r.referer)+'">Apply</button></div>';
+    h+='</div>';
+  });
+  $('t-out').innerHTML=h;
+}
+function applyRule(ref){
+  var key=($('rule-key')||{}).value||'';
+  api('rules',{match:key,referer:ref}).then(function(d){
+    $('rule-msg').textContent=d.error?('Error: '+d.error):('Live now: host contains "'+key+'" -> '+ref+' (re-check to confirm)');
+    loadRules();
+  });
+}
+function loadRules(){
+  api('rules').then(function(d){
+    var h='';
+    d.rules.forEach(function(r){h+='<div class="row"><div class="mono">host has <b>'+esc(r.match)+'</b> -> '+esc(r.referer)+'</div><button class="btn" data-act="del" data-id="'+esc(r.id)+'">Delete</button></div>'});
+    if(!d.rules.length)h='<div class="muted">No live rules yet. Test a failing URL and press Apply on a working referer.</div>';
+    else{
+      var code=d.rules.map(function(r){return 'if (host.includes("'+r.match+'")) return "'+r.referer+'";'}).join(NL);
+      h+='<div class="muted" style="margin-top:10px">Make permanent - paste into getRefererForHost():</div><textarea readonly>'+esc(code)+'</textarea><div class="acts"><button class="btn" data-act="copy" data-text="'+esc(code)+'">Copy as code</button></div>';
+    }
+    $('rules').innerHTML=h;
+  });
+}
+document.addEventListener('click',function(e){
+  var t=e.target.closest('[data-act]');if(!t)return;
+  var a=t.dataset.act;
+  if(a==='copy')copyText(t.dataset.text,t);
+  else if(a==='copyid')copyText($(t.dataset.id).value,t);
+  else if(a==='copyfailing'){if(lastErrors)copyText(lastErrors.items.filter(function(i){return !i.fixed}).map(function(i){return i.url}).join(NL),t)}
+  else if(a==='since')setSince(t.dataset.s);
+  else if(a==='recheck')recheck();
+  else if(a==='runtest')runTest();
+  else if(a==='test'){$('t-url').value=t.dataset.url;runTest();$('t-url').scrollIntoView({behavior:'smooth',block:'center'})}
+  else if(a==='apply')applyRule(t.dataset.ref);
+  else if(a==='del')api('rules/'+t.dataset.id,null,'DELETE').then(loadRules);
+  else if(a==='clear'){if(confirm('Clear the error list?'))api('errors/clear',{}).then(loadErrors)}
+});
+$('t-url').addEventListener('keydown',function(e){if(e.key==='Enter')runTest()});
+setSince('1h');loadRules();
+</script></body></html>`;
+
+  addLog('\uD83E\uDDEA Referer Lab ready: /refcheck (' + rules.length + ' live rules)');
+})();
+// <<< refcheck
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'='.repeat(50)}`);
   console.log(`🚀 Bandwidth Hero`);
