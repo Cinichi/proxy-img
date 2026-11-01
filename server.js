@@ -1237,7 +1237,7 @@ app.get('/logs/stream', (req, res) => {
 // ========================
 // 🏁 Start / shutdown
 // ========================
-// >>> refcheck (Referer Lab: error log by time window, referer tester, live rules)
+// >>> refcheck v2 (Referer Lab: error log, referer tester, bot-challenge detection, live referer + cookie rules)
 ;(function refcheck() {
   const fs = require('fs'), os = require('os'), path = require('path');
   const dns = require('dns'), net = require('net'), http = require('http'), https = require('https');
@@ -1246,27 +1246,33 @@ app.get('/logs/stream', (req, res) => {
   const DATA_DIR = process.env.REFCHECK_DIR || path.join(os.homedir(), '.pm2');
   const ERR_FILE = path.join(DATA_DIR, 'bwhero-errors.json');
   const RULES_FILE = path.join(DATA_DIR, 'bwhero-referers.json');
+  const COOKIES_FILE = path.join(DATA_DIR, 'bwhero-cookies.json');
   const TOKEN = process.env.REFCHECK_TOKEN || '';
   const ALLOW_PRIVATE = process.env.ALLOW_PRIVATE === '1';
   const MAX_URLS = 3000, MAX_HITS = 50, MAX_RECHECK = 40, MAX_REFERERS = 16;
+  const FLAG_TTL = 10 * 60 * 1000;
+  const COOKIE_RE = /^[\x20-\x7e]{3,4000}$/, UA_RE = /^[\x20-\x7e]{5,300}$/;
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
   const KNOWN = ['https://mangak.io/', 'https://likemanga.ink/', 'https://mangabuddy.com/', 'https://res.mgcdn.xyz/',
     'https://mangapill.com/', 'https://hentaifox.com/', 'https://nhentai.net/', 'https://hentalk.pw/'];
 
   // ---------- storage ----------
   function readJson(f, def) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return def; } }
-  function writeJson(f, data) {
+  function writeJson(f, data, mode) {
     try {
       fs.mkdirSync(path.dirname(f), { recursive: true });
-      fs.writeFileSync(f + '.tmp', JSON.stringify(data));
+      fs.writeFileSync(f + '.tmp', JSON.stringify(data), mode ? { mode } : undefined);
       fs.renameSync(f + '.tmp', f);
     } catch (e) {}
   }
   const errors = new Map(Object.entries(readJson(ERR_FILE, {})));
   let rules = readJson(RULES_FILE, []);
   if (!Array.isArray(rules)) rules = [];
+  let cookies = readJson(COOKIES_FILE, []);
+  if (!Array.isArray(cookies)) cookies = [];
   let dirty = false;
   const saveErrors = () => { dirty = false; writeJson(ERR_FILE, Object.fromEntries(errors)); };
+  const saveCookies = () => writeJson(COOKIES_FILE, cookies, 0o600);
   setInterval(() => {
     const old = Date.now() - 7 * 86400000;
     for (const [k, v] of errors) if (v.last < old) { errors.delete(k); dirty = true; }
@@ -1309,7 +1315,7 @@ app.get('/logs/stream', (req, res) => {
     addLog = function (msg) { try { onLog(String(msg)); } catch (_) {} return origAddLog.apply(this, arguments); };
   } catch (e) { console.error('refcheck: could not hook addLog:', e.message); }
 
-  // ---------- live rules (override getRefererForHost, no restart needed) ----------
+  // ---------- live referer rules (override getRefererForHost, no restart needed) ----------
   try {
     const origRef = getRefererForHost;
     getRefererForHost = function (hostname) {
@@ -1318,6 +1324,30 @@ app.get('/logs/stream', (req, res) => {
       return origRef.apply(this, arguments);
     };
   } catch (e) { console.error('refcheck: could not hook getRefererForHost:', e.message); }
+
+  // ---------- live cookie rules (added to the proxy's upstream requests via an axios interceptor) ----------
+  // strict domain match (akuma.moe and *.akuma.moe only) so a cookie can never leak to look-alike hosts
+  function cookieRuleFor(host) {
+    host = String(host || '').toLowerCase();
+    return cookies.find(c => host === c.match || host.endsWith('.' + c.match));
+  }
+  function ckFor(host) { const r = cookieRuleFor(host); return r ? { cookie: r.cookie, ua: r.ua } : null; }
+  function setHeader(cfg, name, val) {
+    if (cfg.headers && typeof cfg.headers.set === 'function') cfg.headers.set(name, val);
+    else { cfg.headers = cfg.headers || {}; cfg.headers[name] = val; }
+  }
+  try {
+    const axiosLib = require('axios');
+    if (axiosLib.interceptors && axiosLib.interceptors.request) {
+      axiosLib.interceptors.request.use(cfg => {
+        try {
+          const r = cookieRuleFor(new URL(cfg.url, cfg.baseURL).hostname);
+          if (r) { setHeader(cfg, 'Cookie', r.cookie); if (r.ua) setHeader(cfg, 'User-Agent', r.ua); }
+        } catch (_) {}
+        return cfg;
+      });
+    }
+  } catch (e) { console.error('refcheck: could not add cookie interceptor:', e.message); }
 
   // ---------- safe probing (SSRF guarded) ----------
   function isPrivateIp(ip) {
@@ -1355,15 +1385,35 @@ app.get('/logs/stream', (req, res) => {
     if (!ALLOW_PRIVATE && net.isIP(h) && isPrivateIp(h)) throw new Error('Blocked private address');
   }
 
-  // headers only, body is dropped immediately (no bandwidth wasted)
-  function probeOnce(u, referer) {
+  // which bot-protection served this non-image response?
+  function classify(h, body) {
+    const server = String(h.server || '').toLowerCase();
+    const sc = [].concat(h['set-cookie'] || []).join(';');
+    const b = String(body || '').toLowerCase();
+    if (server.includes('ddos-guard') || /__ddg[a-z0-9]*_/.test(sc) || b.includes('ddos-guard')) return 'DDoS-Guard';
+    if (h['cf-mitigated'] === 'challenge' || /just a moment|cf-chl|attention required|cf-browser-verification/.test(b)) return 'Cloudflare';
+    if (server.includes('sucuri') || h['x-sucuri-id']) return 'Sucuri';
+    if (/captcha|verify you are human|checking your browser|are you a robot/.test(b)) return 'Bot check';
+    return '';
+  }
+
+  // images: headers only, body dropped at once. Anything else: first 4KB, to identify the block page
+  function probeOnce(u, referer, ck) {
     return new Promise((resolve, reject) => {
-      const headers = { 'User-Agent': UA, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
+      const headers = { 'User-Agent': (ck && ck.ua) || UA, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' };
       if (referer) headers.Referer = referer;
+      if (ck && ck.cookie) headers.Cookie = ck.cookie;
       const lib = u.protocol === 'https:' ? https : http;
       const req = lib.request(u, { method: 'GET', headers, lookup: guardedLookup, agent: false, timeout: 10000 }, res => {
-        res.destroy();
-        resolve({ status: res.statusCode, headers: res.headers });
+        const chunks = []; let n = 0, done = false;
+        const finish = () => {
+          if (done) return; done = true; res.destroy();
+          resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') });
+        };
+        if (/^image\//i.test(String(res.headers['content-type'] || ''))) return finish();
+        res.on('data', c => { chunks.push(c); n += c.length; if (n >= 4096) finish(); });
+        res.on('end', finish);
+        res.on('error', finish);
       });
       req.on('timeout', () => { const e = new Error('timeout'); e.code = 'ETIMEDOUT'; req.destroy(e); });
       req.on('error', reject);
@@ -1371,24 +1421,26 @@ app.get('/logs/stream', (req, res) => {
     });
   }
 
-  async function probe(urlStr, referer) {
+  async function probe(urlStr, referer, ck) {
     const t0 = Date.now();
     try {
       let u = new URL(urlStr);
+      const origin = u.hostname;
       for (let i = 0; i <= 5; i++) {
         assertAllowed(u);
-        const r = await probeOnce(u, referer);
+        const r = await probeOnce(u, referer, u.hostname === origin ? ck : null);
         if ([301, 302, 303, 307, 308].includes(r.status) && r.headers.location) { u = new URL(r.headers.location, u); continue; }
         const type = String(r.headers['content-type'] || '');
+        const ok = r.status === 200 && /^image\//i.test(type);
         return {
-          status: r.status, type: type.split(';')[0], ms: Date.now() - t0,
+          status: r.status, type: type.split(';')[0], ms: Date.now() - t0, ok,
           len: r.headers['content-length'] ? Number(r.headers['content-length']) : null,
-          ok: r.status === 200 && /^image\//i.test(type)
+          provider: ok ? '' : classify(r.headers, r.body)
         };
       }
-      return { status: 0, error: 'too many redirects', ok: false, ms: Date.now() - t0 };
+      return { status: 0, error: 'too many redirects', ok: false, ms: Date.now() - t0, provider: '' };
     } catch (e) {
-      return { status: 0, error: e.code || e.message, ok: false, ms: Date.now() - t0 };
+      return { status: 0, error: e.code || e.message, ok: false, ms: Date.now() - t0, provider: '' };
     }
   }
 
@@ -1429,6 +1481,34 @@ app.get('/logs/stream', (req, res) => {
     return p;
   }
 
+  const baseDomain = host => (net.isIP(host) ? host : host.split('.').slice(-2).join('.'));
+
+  function dominant(list) {
+    const c = {};
+    list.filter(Boolean).forEach(x => { c[x] = (c[x] || 0) + 1; });
+    const top = Object.keys(c).sort((a, b) => c[b] - c[a])[0];
+    return top && c[top] * 2 >= list.length ? top : '';
+  }
+
+  // ---------- per-host diagnosis: fixable by referer / bot challenge / unknown ----------
+  const hostFlags = new Map();
+  const classifying = new Set();
+
+  async function classifyHost(host, sampleUrl) {
+    if (classifying.has(host)) return;
+    classifying.add(host);
+    try {
+      const ck = ckFor(host);
+      const res = await pool(candidates(sampleUrl, []), 4, async c => Object.assign({ referer: c.referer }, await probe(sampleUrl, c.referer, ck)));
+      const good = res.find(r => r.ok);
+      if (good) hostFlags.set(host, { state: 'fixable', referer: good.referer, at: Date.now() });
+      else {
+        const provider = dominant(res.map(r => r.provider));
+        hostFlags.set(host, { state: provider ? 'challenge' : 'unknown', provider, status: res[0] ? res[0].status : 0, at: Date.now() });
+      }
+    } catch (e) {} finally { classifying.delete(host); }
+  }
+
   function cutoffFor(s) {
     s = String(s || '1h');
     if (s === 'all') return 0;
@@ -1446,6 +1526,10 @@ app.get('/logs/stream', (req, res) => {
     if (g === TOKEN) return next();
     res.status(401).json({ error: 'token required: open /refcheck?token=YOUR_TOKEN' });
   }
+  const maskCookies = () => cookies.map(c => ({
+    id: c.id, match: c.match, added: c.added, ua: !!c.ua,
+    names: c.cookie.split(';').map(s => s.trim().split('=')[0]).filter(Boolean)
+  }));
 
   app.get('/refcheck', auth, (req, res) => res.type('html').send(PAGE));
 
@@ -1459,20 +1543,35 @@ app.get('/logs/stream', (req, res) => {
       const hits = e.hits.filter(t => t >= cutoff).length;
       items.push({ url: e.url, host: e.host, kind: e.kind, last: e.last, hits, fixed });
       if (fixed) { recovered++; continue; }
-      const h = hostMap.get(e.host) || { host: e.host, urls: 0, hits: 0, kinds: {} };
+      const h = hostMap.get(e.host) || { host: e.host, urls: 0, hits: 0, kinds: {}, sample: e.url, sampleAt: 0 };
       h.urls++; h.hits += hits; h.kinds[e.kind] = (h.kinds[e.kind] || 0) + 1;
+      if (e.last > h.sampleAt) { h.sample = e.url; h.sampleAt = e.last; }
       hostMap.set(e.host, h);
     }
+    const failHosts = [...hostMap.values()].sort((a, b) => b.hits - a.hits).slice(0, 30);
+    const names = failHosts.map(h => h.host);
+    let started = 0, pending = 0, blocked = 0, fixable = 0;
+    failHosts.forEach(h => {
+      const f = hostFlags.get(h.host);
+      if (!f || Date.now() - f.at > FLAG_TTL) {
+        pending++;
+        if (started < 4 && classifying.size < 5 && !classifying.has(h.host)) { started++; classifyHost(h.host, h.sample); }
+      }
+      h.flag = f ? { state: f.state, provider: f.provider || '', referer: f.referer || '', status: f.status || 0 } : null;
+      h.suggest = suggest(h.host, names);
+      if (f && f.state === 'challenge') blocked += h.urls;
+      if (f && f.state === 'fixable') fixable += h.urls;
+      delete h.sample; delete h.sampleAt;
+    });
     items.sort((a, b) => (a.fixed - b.fixed) || (b.last - a.last));
     res.json({
       since: String(req.query.since || '1h'), now: Date.now(),
-      failing: items.length - recovered, recovered,
-      hosts: [...hostMap.values()].sort((a, b) => b.hits - a.hits).slice(0, 30),
-      items: items.slice(0, 200)
+      failing: items.length - recovered, recovered, blocked, fixable, pending,
+      hosts: failHosts, items: items.slice(0, 200)
     });
   });
 
-  app.post('/refcheck/api/errors/clear', auth, (req, res) => { errors.clear(); saveErrors(); res.json({ ok: true }); });
+  app.post('/refcheck/api/errors/clear', auth, (req, res) => { errors.clear(); hostFlags.clear(); saveErrors(); res.json({ ok: true }); });
 
   app.post('/refcheck/api/test', auth, json(), async (req, res) => {
     if (busy >= 3) return res.status(429).json({ error: 'Busy, try again in a few seconds' });
@@ -1481,12 +1580,23 @@ app.get('/logs/stream', (req, res) => {
     let u;
     try { u = new URL(urlStr); assertAllowed(u); } catch (e) { return res.status(400).json({ error: e.message }); }
     const extra = String(b.extra || '').split(/[\s,]+/).filter(s => /^https?:\/\//i.test(s)).slice(0, 4);
+    const cookieStr = String(b.cookie || '').trim().replace(/^cookie:\s*/i, '');
+    const uaStr = String(b.ua || '').trim();
+    if (cookieStr && !COOKIE_RE.test(cookieStr)) return res.status(400).json({ error: 'Cookie has invalid characters - paste it as name=value; name2=value2' });
+    if (uaStr && !UA_RE.test(uaStr)) return res.status(400).json({ error: 'User-Agent has invalid characters' });
+    const rule = cookieRuleFor(u.hostname);
+    const ck = cookieStr ? { cookie: cookieStr, ua: uaStr } : (rule ? { cookie: rule.cookie, ua: rule.ua } : null);
     busy++;
     try {
-      const results = await pool(candidates(urlStr, extra), 5, async c => Object.assign({ label: c.label, referer: c.referer }, await probe(urlStr, c.referer)));
+      const results = await pool(candidates(urlStr, extra), 5, async c => Object.assign({ label: c.label, referer: c.referer }, await probe(urlStr, c.referer, ck)));
       results.sort((a, b2) => (b2.ok - a.ok) || (a.ms - b2.ms));
+      const anyOk = results.some(r => r.ok);
       const hosts = [...new Set([...errors.values()].filter(e => !(e.ok > e.last)).map(e => e.host))];
-      res.json({ url: urlStr, host: u.hostname, suggest: suggest(u.hostname, hosts), results });
+      res.json({
+        url: urlStr, host: u.hostname, suggest: suggest(u.hostname, hosts),
+        cookie: cookieStr ? 'explicit' : (rule ? 'rule' : ''), cookieDomain: baseDomain(u.hostname),
+        provider: anyOk ? '' : dominant(results.map(r => r.provider)), results
+      });
     } finally { busy--; }
   });
 
@@ -1501,15 +1611,15 @@ app.get('/logs/stream', (req, res) => {
     try {
       const out = await pool(all.slice(0, MAX_RECHECK), 6, async e => {
         const r = ref || getRefererForHost(e.host, e.url);
-        const p = await probe(e.url, r);
+        const p = await probe(e.url, r, ckFor(e.host));
         if (p.ok && !ref) { e.ok = Date.now(); dirty = true; }
-        return { url: e.url, host: e.host, referer: r, status: p.status, type: p.type, error: p.error, ok: p.ok, ms: p.ms };
+        return { url: e.url, host: e.host, referer: r, status: p.status, type: p.type, error: p.error, ok: p.ok, ms: p.ms, provider: p.provider };
       });
       res.json({ checked: out.length, truncated: all.length > MAX_RECHECK, referer: ref || 'current rules', good: out.filter(o => o.ok), bad: out.filter(o => !o.ok) });
     } finally { busy--; }
   });
 
-  app.get('/refcheck/api/rules', auth, (req, res) => res.json({ rules }));
+  app.get('/refcheck/api/rules', auth, (req, res) => res.json({ rules, cookies: maskCookies() }));
 
   app.post('/refcheck/api/rules', auth, json(), (req, res) => {
     const b = req.body || {};
@@ -1521,6 +1631,7 @@ app.get('/logs/stream', (req, res) => {
     rules.unshift({ id: Date.now().toString(36), match, referer, added: Date.now() });
     if (rules.length > 100) rules.length = 100;
     writeJson(RULES_FILE, rules);
+    hostFlags.clear();
     addLog('\uD83E\uDDEA RULE | ' + match + ' -> ' + referer);
     res.json({ ok: true, rules });
   });
@@ -1528,7 +1639,32 @@ app.get('/logs/stream', (req, res) => {
   app.delete('/refcheck/api/rules/:id', auth, (req, res) => {
     rules = rules.filter(r => r.id !== req.params.id);
     writeJson(RULES_FILE, rules);
+    hostFlags.clear();
     res.json({ ok: true, rules });
+  });
+
+  app.post('/refcheck/api/cookies', auth, json(), (req, res) => {
+    const b = req.body || {};
+    const match = String(b.match || '').trim().toLowerCase().replace(/^\./, '');
+    const cookie = String(b.cookie || '').trim().replace(/^cookie:\s*/i, '');
+    const ua = String(b.ua || '').trim();
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(match)) return res.status(400).json({ error: 'Domain must be a full domain like akuma.moe' });
+    if (!COOKIE_RE.test(cookie)) return res.status(400).json({ error: 'Cookie missing or has invalid characters' });
+    if (ua && !UA_RE.test(ua)) return res.status(400).json({ error: 'User-Agent has invalid characters' });
+    cookies = cookies.filter(c => c.match !== match);
+    cookies.unshift({ id: Date.now().toString(36), match, cookie, ua, added: Date.now() });
+    if (cookies.length > 20) cookies.length = 20;
+    saveCookies();
+    hostFlags.clear();
+    addLog('\uD83E\uDDEA COOKIE RULE | ' + match + ' (' + maskCookies()[0].names.length + ' cookies)');
+    res.json({ ok: true, cookies: maskCookies() });
+  });
+
+  app.delete('/refcheck/api/cookies/:id', auth, (req, res) => {
+    cookies = cookies.filter(c => c.id !== req.params.id);
+    saveCookies();
+    hostFlags.clear();
+    res.json({ ok: true, cookies: maskCookies() });
   });
 
   // ---------- page ----------
@@ -1553,9 +1689,10 @@ textarea{height:110px;resize:vertical;font-size:11px}
 .row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px}
 .row>div{min-width:0}.row:last-child{border-bottom:none}
 .mono{font-family:var(--mono);word-break:break-all}
-.muted{color:var(--muted)}.good{color:var(--green)}.bad{color:var(--red)}
+.muted{color:var(--muted)}.good{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}
 .badge{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:10px;background:var(--bg)}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.note{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;margin:8px 0;font-size:12px;line-height:1.5}
 </style></head><body>
 <div class="top"><a href="/dashboard">&larr; Dashboard</a><b>Referer Lab</b><span></span></div>
 <div class="wrap">
@@ -1580,19 +1717,21 @@ textarea{height:110px;resize:vertical;font-size:11px}
 <div class="card"><h3>Test one URL against many referers</h3>
  <input id="t-url" placeholder="https://rx.qvzra.org/r/p/xxx/yyy.webp">
  <input id="t-extra" placeholder="Extra referer(s) to try (optional)">
+ <input id="t-cookie" placeholder="Cookie header from a browser that passed the check (optional)">
+ <input id="t-ua" placeholder="User-Agent of that same browser (optional)">
  <div class="acts"><button class="btn pri" id="btn-test" data-act="runtest">Test</button></div>
  <div id="t-out"></div>
 </div>
 
-<div class="card"><h3>Live referer rules (active instantly, no restart)</h3>
- <div id="rules"></div><div id="rule-msg" class="muted" style="margin-top:8px"></div>
+<div class="card"><h3>Live rules (active instantly, no restart)</h3>
+ <div id="rules"></div><div id="ckrules"></div><div id="rule-msg" class="muted" style="margin-top:8px"></div>
 </div>
 </div>
 <script>
 var $=function(i){return document.getElementById(i)};
 var NL=String.fromCharCode(10);
 var TOKEN=new URLSearchParams(location.search).get('token')||'';
-var since='1h',lastErrors=null;
+var since='1h',lastErrors=null,polls=0;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function api(path,body,method){
   var u='/refcheck/api/'+path;if(TOKEN)u+=(u.indexOf('?')<0?'?':'&')+'token='+encodeURIComponent(TOKEN);
@@ -1607,14 +1746,28 @@ function copyText(t,btn){
   function fb(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{document.execCommand('copy');done()}catch(e){prompt('Copy:',t)}document.body.removeChild(a)}
   if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(done,fb);else fb();
 }
-function setSince(s){since=s;[].forEach.call(document.querySelectorAll('.chip'),function(c){c.classList.toggle('on',c.dataset.s===s)});loadErrors()}
+function setSince(s){since=s;polls=0;[].forEach.call(document.querySelectorAll('.chip'),function(c){c.classList.toggle('on',c.dataset.s===s)});loadErrors()}
+function flagHtml(f){
+  if(!f)return '<span class="badge muted">checking...</span> ';
+  if(f.state==='challenge')return '<span class="badge bad">&#128737; '+esc(f.provider)+' bot challenge</span> ';
+  if(f.state==='fixable')return '<span class="badge good">&#128161; fixable with a referer</span> ';
+  return '<span class="badge warn">blocked ('+(f.status||'?')+')</span> ';
+}
 function loadErrors(){
   api('errors?since='+since).then(function(d){
     lastErrors=d;
-    var h='<div class="muted" style="margin-bottom:8px">'+d.failing+' failing &middot; '+d.recovered+' recovered (last '+esc(since)+')</div>';
+    var h='<div class="muted" style="margin-bottom:8px">'+d.failing+' failing &middot; '+d.recovered+' recovered (last '+esc(since)+')';
+    if(d.blocked)h+=' &middot; <span class="bad">'+d.blocked+' behind a bot challenge</span>';
+    if(d.fixable)h+=' &middot; <span class="good">'+d.fixable+' fixable by referer</span>';
+    h+='</div>';
     d.hosts.forEach(function(x){
       var k=Object.keys(x.kinds).map(function(n){return n+' x'+x.kinds[n]}).join(', ');
-      h+='<div class="row"><span class="mono">'+esc(x.host)+'</span><span class="muted">'+x.urls+' url &middot; '+x.hits+' hits &middot; '+esc(k)+'</span></div>';
+      h+='<div class="row"><div><span class="mono">'+esc(x.host)+'</span> '+flagHtml(x.flag)+'<div class="muted">'+x.urls+' url &middot; '+x.hits+' hits &middot; '+esc(k)+'</div>';
+      if(x.flag&&x.flag.state==='fixable')h+='<div class="mono good">'+esc(x.flag.referer||'(no referer needed)')+'</div>';
+      if(x.flag&&x.flag.state==='challenge')h+='<div class="muted">No referer can pass this. Use a cookie rule (Test card) or load this source directly.</div>';
+      h+='</div>';
+      if(x.flag&&x.flag.state==='fixable'&&x.flag.referer)h+='<button class="btn pri" data-act="applyhost" data-key="'+esc(x.suggest)+'" data-ref="'+esc(x.flag.referer)+'">Apply</button>';
+      h+='</div>';
     });
     h+='<div style="margin-top:10px">';
     d.items.slice(0,60).forEach(function(it){
@@ -1622,10 +1775,11 @@ function loadErrors(){
     });
     if(!d.items.length)h+='<div class="muted">No errors in this window.</div>';
     $('err-box').innerHTML=h+'</div>';
+    if(d.pending>0&&polls<3){polls++;setTimeout(loadErrors,3000)}
   });
 }
 function recheck(){
-  var b=$('btn-recheck');b.disabled=true;b.textContent='Checking...';
+  var b=$('btn-recheck');b.disabled=true;b.textContent='Checking...';polls=0;
   api('recheck',{since:since,referer:$('re-ref').value.trim()}).then(function(d){
     b.disabled=false;b.textContent='Re-check all';
     if(d.error){$('re-out').innerHTML='<div class="bad" style="margin-top:8px">'+esc(d.error)+'</div>';return}
@@ -1635,8 +1789,9 @@ function recheck(){
       h+='<div class="good">'+d.good.length+' good - copy these</div><textarea readonly id="good-list">'+esc(urls)+'</textarea><div class="acts"><button class="btn ok" data-act="copyid" data-id="good-list">Copy '+d.good.length+' links</button></div>';
     }
     if(d.bad.length){
-      h+='<div class="bad" style="margin-top:10px">'+d.bad.length+' still failing</div>';
-      d.bad.forEach(function(x){h+='<div class="row"><div class="mono">'+esc(x.url)+'<div class="muted">'+(x.status||esc(x.error||'err'))+' '+esc(x.type||'')+'</div></div><button class="btn" data-act="test" data-url="'+esc(x.url)+'">Test</button></div>'});
+      var ch=d.bad.filter(function(x){return x.provider}).length;
+      h+='<div class="bad" style="margin-top:10px">'+d.bad.length+' still failing'+(ch?' ('+ch+' behind a bot challenge)':'')+'</div>';
+      d.bad.forEach(function(x){h+='<div class="row"><div class="mono">'+esc(x.url)+'<div class="muted">'+(x.status||esc(x.error||'err'))+' '+esc(x.type||'')+(x.provider?' &middot; &#128737; '+esc(x.provider):'')+'</div></div><button class="btn" data-act="test" data-url="'+esc(x.url)+'">Test</button></div>'});
     }
     if(!d.good.length&&!d.bad.length)h+='<div class="muted">Nothing to check in this window.</div>';
     $('re-out').innerHTML=h;loadErrors();
@@ -1644,42 +1799,56 @@ function recheck(){
 }
 function runTest(){
   var b=$('btn-test');b.disabled=true;b.textContent='Testing...';
-  api('test',{url:$('t-url').value.trim(),extra:$('t-extra').value.trim()}).then(function(d){b.disabled=false;b.textContent='Test';renderTest(d)});
+  api('test',{url:$('t-url').value.trim(),extra:$('t-extra').value.trim(),cookie:$('t-cookie').value.trim(),ua:$('t-ua').value.trim()}).then(function(d){b.disabled=false;b.textContent='Test';renderTest(d)});
 }
 function renderTest(d){
   if(d.error){$('t-out').innerHTML='<div class="bad" style="margin-top:8px">'+esc(d.error)+'</div>';return}
   var best=d.results.filter(function(r){return r.ok})[0];
-  var h='<div class="muted" style="margin:6px 0">'+esc(d.host)+'</div>';
+  var h='<div class="muted" style="margin:6px 0">'+esc(d.host)+(d.cookie==='rule'?' &middot; using the saved cookie rule':'')+(d.cookie==='explicit'?' &middot; using the cookie you pasted':'')+'</div>';
   if(best){
     var curl='curl -L'+(best.referer?' -e "'+best.referer+'"':'')+' "'+d.url+'" -o /dev/null -w "%{http_code} %{content_type}"';
     h+='<div class="good" style="margin:6px 0">Working link + referer</div><textarea readonly>'+esc(d.url+NL+'referer: '+(best.referer||'(none)')+NL+curl)+'</textarea>';
     h+='<div class="acts"><button class="btn ok" data-act="copy" data-text="'+esc(d.url)+'">Copy link</button><button class="btn" data-act="copy" data-text="'+esc(curl)+'">Copy curl</button></div>';
+    if(d.cookie==='explicit'){
+      h+='<div class="note good">This works with the cookie you pasted. Save it so the proxy sends it for this domain (and its subdomains) automatically:<input id="ck-key" value="'+esc(d.cookieDomain)+'"><button class="btn pri" data-act="applycookie">Save cookie rule</button></div>';
+    }
     h+='<div class="muted" style="margin-top:10px">Rule key (host contains):</div><input id="rule-key" value="'+esc(d.suggest)+'">';
-  }else h+='<div class="bad" style="margin:6px 0">No referer worked - link may be expired or needs cookies/other headers</div>';
+  }else if(d.provider){
+    h+='<div class="note bad">&#128737; Every referer is blocked by <b>'+esc(d.provider)+'</b>. This is a bot challenge, not a referer problem, so no referer rule can fix it. Paste a cookie (and the User-Agent) from a browser that passed the check into the boxes above and test again, or load this source directly instead of through the proxy.</div>';
+  }else h+='<div class="bad" style="margin:6px 0">No referer worked - link may be expired or needs other headers</div>';
   d.results.forEach(function(r){
-    h+='<div class="row"><div><span class="badge '+(r.ok?'good':'bad')+'">'+(r.ok?'OK ':'X ')+(r.status||esc(r.error||'err'))+'</span> <span class="muted">'+esc(r.type||'')+' '+(r.len!=null?kb(r.len)+' ':'')+r.ms+'ms</span><div class="mono">'+esc(r.label)+': '+esc(r.referer||'(none)')+'</div></div>';
+    h+='<div class="row"><div><span class="badge '+(r.ok?'good':'bad')+'">'+(r.ok?'OK ':'X ')+(r.status||esc(r.error||'err'))+'</span> <span class="muted">'+esc(r.type||'')+' '+(r.len!=null?kb(r.len)+' ':'')+r.ms+'ms'+(r.provider?' &middot; &#128737; '+esc(r.provider):'')+'</span><div class="mono">'+esc(r.label)+': '+esc(r.referer||'(none)')+'</div></div>';
     if(r.ok&&r.referer)h+='<div class="acts"><button class="btn" data-act="copy" data-text="'+esc(r.referer)+'">Copy</button><button class="btn pri" data-act="apply" data-ref="'+esc(r.referer)+'">Apply</button></div>';
     h+='</div>';
   });
   $('t-out').innerHTML=h;
 }
-function applyRule(ref){
-  var key=($('rule-key')||{}).value||'';
+function saveRule(key,ref){
   api('rules',{match:key,referer:ref}).then(function(d){
     $('rule-msg').textContent=d.error?('Error: '+d.error):('Live now: host contains "'+key+'" -> '+ref+' (re-check to confirm)');
+    loadRules();polls=0;loadErrors();
+  });
+}
+function applyCookie(){
+  api('cookies',{match:$('ck-key').value,cookie:$('t-cookie').value.trim(),ua:$('t-ua').value.trim()}).then(function(d){
+    $('rule-msg').textContent=d.error?('Error: '+d.error):('Cookie rule live for '+$('ck-key').value+' (values are never shown again)');
     loadRules();
   });
 }
 function loadRules(){
   api('rules').then(function(d){
-    var h='';
+    var h='<div class="muted" style="margin-bottom:6px">Referer rules</div>';
     d.rules.forEach(function(r){h+='<div class="row"><div class="mono">host has <b>'+esc(r.match)+'</b> -> '+esc(r.referer)+'</div><button class="btn" data-act="del" data-id="'+esc(r.id)+'">Delete</button></div>'});
-    if(!d.rules.length)h='<div class="muted">No live rules yet. Test a failing URL and press Apply on a working referer.</div>';
+    if(!d.rules.length)h+='<div class="muted">None yet. Test a failing URL and press Apply on a working referer.</div>';
     else{
       var code=d.rules.map(function(r){return 'if (host.includes("'+r.match+'")) return "'+r.referer+'";'}).join(NL);
       h+='<div class="muted" style="margin-top:10px">Make permanent - paste into getRefererForHost():</div><textarea readonly>'+esc(code)+'</textarea><div class="acts"><button class="btn" data-act="copy" data-text="'+esc(code)+'">Copy as code</button></div>';
     }
     $('rules').innerHTML=h;
+    var c='<div class="muted" style="margin:14px 0 6px">Cookie rules (sent only to that domain and its subdomains)</div>';
+    d.cookies.forEach(function(x){c+='<div class="row"><div class="mono"><b>'+esc(x.match)+'</b> &middot; '+x.names.length+' cookies<div class="muted">'+esc(x.names.join(', '))+(x.ua?' &middot; custom User-Agent':'')+'</div></div><button class="btn" data-act="delck" data-id="'+esc(x.id)+'">Delete</button></div>'});
+    if(!d.cookies.length)c+='<div class="muted">None. Cookie values are stored on the server and never shown here.</div>';
+    $('ckrules').innerHTML=c;
   });
 }
 document.addEventListener('click',function(e){
@@ -1692,15 +1861,18 @@ document.addEventListener('click',function(e){
   else if(a==='recheck')recheck();
   else if(a==='runtest')runTest();
   else if(a==='test'){$('t-url').value=t.dataset.url;runTest();$('t-url').scrollIntoView({behavior:'smooth',block:'center'})}
-  else if(a==='apply')applyRule(t.dataset.ref);
+  else if(a==='apply')saveRule(($('rule-key')||{}).value||'',t.dataset.ref);
+  else if(a==='applyhost')saveRule(t.dataset.key,t.dataset.ref);
+  else if(a==='applycookie')applyCookie();
   else if(a==='del')api('rules/'+t.dataset.id,null,'DELETE').then(loadRules);
+  else if(a==='delck')api('cookies/'+t.dataset.id,null,'DELETE').then(loadRules);
   else if(a==='clear'){if(confirm('Clear the error list?'))api('errors/clear',{}).then(loadErrors)}
 });
 $('t-url').addEventListener('keydown',function(e){if(e.key==='Enter')runTest()});
 setSince('1h');loadRules();
 </script></body></html>`;
 
-  addLog('\uD83E\uDDEA Referer Lab ready: /refcheck (' + rules.length + ' live rules)');
+  addLog('\uD83E\uDDEA Referer Lab ready: /refcheck (' + rules.length + ' referer rules, ' + cookies.length + ' cookie rules)');
 })();
 // <<< refcheck
 
