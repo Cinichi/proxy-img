@@ -414,6 +414,7 @@ function readPm2Logs() {
 // ========================
 function getRefererForHost(hostname, targetUrl = '') {
   const host = hostname.toLowerCase();
+  if (host.includes("imgyaoiscan")) return "https://yaoiscan.com/read/the-foxs-love-refresher/";
 
   if (/^s\d+\.mbcdns[a-z]{1,3}\.org$/.test(host)) {
     const match = targetUrl.match(/\/manga\/([^/]+)\/chapter-(\d+)/i);
